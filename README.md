@@ -7,6 +7,6 @@ The code can also found within HDSci-Lab/MLIDA repository amongst further work o
 
 ## Citation
 
-If you use MLIDA in your work, please cite:
+If you use NIHR-HIC-Cirrhosis-IDA in your work, please cite:
 
 Maynard, S., *et al*. (2026). *Machine Learning to Classify Iron Deficiency Anaemia in Cirrhosis using Routinely Collected Data*.
