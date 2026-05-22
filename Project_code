@@ -1,0 +1,4316 @@
+# # Name: S Maynard
+# Project: Liver HIC Project i 
+# Version Number: V2.0
+# Date: 2025/04/04
+# File type - .R
+# Project_i_liver_IDA_classification ---------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+# Data Source - Project i
+# Run project i files for data 
+
+# Load Packages
+if(F){
+  install.packages("readr")
+  install.packages("data.table")
+  install.packages("tidyverse")
+  install.packages("rmarkdown")
+  install.packages("tableone")
+}
+
+library(readr)
+library(data.table)
+library(dplyr)
+library(stringr)
+library(tidyverse)
+library(lubridate)
+library(tableone)
+
+# Turn off scientific notation
+options(scipen = 999)
+
+## IMPORT DATA
+icd_diagnosis.data <- read_csv("~/Project i/Data/project_i_icd_diagnosis.csv", col_names = T)
+Demographics.data <- read.csv("~/Project i/Data/project_i_demographics.csv")
+Demographics.definitions <- read.csv("~/Project i/Data/definitions/dt_ethnic_category.csv")
+riskfactor.data <- read.csv("~/Project i/Data/project_i_risk_factor.csv") 
+Labtest.data <- read.csv("~/Project i/Data/project_i_lab_test.csv")
+death.data <- read.csv("~/Project i/Data/project_i_death.csv")
+
+
+## COHORT SELECTION
+
+### Cirrhosis ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+# 1,645009 obs (Nov 2024)
+
+## Date and time
+#Convert date time format for diagnosis date and admission date
+icd_diagnosis.data$diagnosis_date <- ymd(icd_diagnosis.data$diagnosis_date)
+icd_diagnosis.data$admission_date <- ymd(icd_diagnosis.data$admission_date)
+
+# Unique study ID within ICD codes - 28,694 (Nov 2024) patients
+length(unique(icd_diagnosis.data$study_subject_id))
+
+# Column NAs
+na_counts <- icd_diagnosis.data %>% 
+  summarise(across(everything(), ~ sum(is.na(.)))) %>%
+  pivot_longer(cols = everything(), names_to = "Column", values_to = "NA_Count")
+print(na_counts)
+
+rm(na_counts)
+
+# NB 781017 (nov 2024) have no diagnosis date
+# 859044 have no admission date
+
+# Take earliest as 'first record of diagnosis'
+# Pmin provides earliest date ignoring NAs and delivers this 
+
+icd_diagnosis.data %>%
+  mutate(earliest_diagnosis = pmin(diagnosis_date, admission_date, na.rm = T)
+  ) -> icd_diagnosis.data
+
+sum(is.na(icd_diagnosis.data$earliest_diagnosis))
+
+# Now only 30,173 without diagnosis date
+
+# 3 methods of diagnosis - ICD10 code/ SNOMED/ description
+# No. of patient entries missing
+# 1. ICD_10 code = 30615
+# 2. snomed_code = 1584459
+# 3. description = 384453
+
+# Exclude those which have NA in ALL (i.e insufficient data for diagnosis/exclusion of cirrhosis)
+
+icd_diagnosis.data %>%
+  mutate (exclude = if_else(is.na(icd_code) & is.na(snomed_code) & is.na(diagnosis_description), T, F)
+  ) -> icd_diagnosis.data
+table(icd_diagnosis.data$exclude) # No observations have NA for all
+
+# Remove exclude column
+icd_diagnosis.data %>%
+  select(-exclude) -> icd_diagnosis.data
+
+# New column to icd_diagnosis.data with patients who have diagnosis in keeping cirrhosis from:
+
+# 1. ICD 10 code ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+table(icd_diagnosis.data$icd_code)
+
+# ICD codes in keeping cirrhosis 
+icd_codes <- c("I85", "I850", "I859","I864", "I982", "I983", "K703", "K717","K744","K745","K746", "K766", "K767", "R18") # NB K74 removed as no 'K74' in isolation
+pattern <- paste0("(?i)", paste(icd_codes, collapse = "|")) # (?i) makes it case-insensitive
+
+# At individual icd code level
+icd_diagnosis.data <- icd_diagnosis.data %>%
+  mutate(
+    # Check if any Icd code matches the pattern and assign binary indicator variable if TRUE
+    cirrhosis_icd = if_else(
+      str_detect(str_replace_all(icd_code,"[.xX]",""),  pattern),
+      1L,  # Snomed cirrho code match
+      0L   # No snomed cirrho code match
+    )
+  )
+
+icd_diagnosis.data <- icd_diagnosis.data %>%
+  mutate(
+    # Check if any Icd code matches the pattern and pull in earliest date if TRUE
+    cirrhosis_icd_date = if_else(
+      str_detect(str_replace_all(icd_code,"[.xX]",""),  pattern),
+      earliest_diagnosis,  # Icd cirrho code match
+      as.Date(NA)   # No Icd cirrho code match
+    )
+  )
+
+# Check unique patients captured with icd code in keeping cirrhosis
+
+table(icd_diagnosis.data$cirrhosis_icd)
+
+icd_diagnosis.data %>%
+  group_by(cirrhosis_icd) %>%
+  summarise(patient_count = n_distinct(study_subject_id)) -> cirrhosis_by_icd # 5271 patients have cirrhosis using icd10 codes
+
+# check what codes
+icd_diagnosis.data %>%
+  filter(cirrhosis_icd == T) %>%
+  group_by(icd_code) %>%
+  summarise(observations = n()) -> cirrhosis_code_count 
+
+# K74 codes excluded other than K744, K745, K746 (K740 Hepatic fibrosis and # K743 Primary Biliary Cirrhosis,
+# K741 Hepatic sclerosis (n=4) K742 Hepatic fibrosis with hepatic sclerosis (n=6) --> removes only 4 unique patients)
+
+# tidy environment
+rm(cirrhosis_by_icd)
+rm(cirrhosis_code_count)
+
+# 2. Description -----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+table(icd_diagnosis.data$diagnosis_description)
+
+description_in <- 'end stage liver disease|cirrho|chronic hepatic failure|varice|portal hypertension|ascit|hepatic encephalopathy|hepatorenal syndrome|child pugh|meld'
+description_out <- 'Genital varices in pregnancy|Exposure to varicella|Hepatic fibrosis|Hepatic fibrosis with hepatic sclerosis|Malignant ascites|Pelvic varices|Requires varicella vaccination|Scrotal varices|
+VZV - Varicella-zoster virus|Varicella|Varicella encephalitis|Varicella pneumonitis|Varicella without complication|Varicella-zoster virus infection|Vulval varices|Sublingual varices|
+Primary biliary cirrhosis'
+
+# Convert the exclude_pattern to exact matches for each term
+exact_description_out <- description_out %>%
+  str_split("\\|", simplify = TRUE) %>%                # Split the string by "|"
+  paste0("^", ., "$") %>%                              # Wrap each term in ^ and $
+  paste(collapse = "|")                                # Collapse back into a single string
+
+include_pattern <- regex(description_in, ignore_case = T)
+exclude_pattern <- regex(exact_description_out, ignore_case = T)
+
+# At individual diagnosis level to generate binary indicator variable
+icd_diagnosis.data <- icd_diagnosis.data %>%
+  mutate(
+    # Check if any diagnosis matches the inclusion pattern after exclusion of exact patterns
+    cirrhosis_desc = if_else(
+      str_detect(diagnosis_description, include_pattern) & 
+        !str_detect(diagnosis_description, exclude_pattern),
+      1L,  # Include patient if any diagnosis matches after exclusion
+      0L   # Exclude patient if none of the diagnoses match
+    )
+  )
+
+# At individual diagnosis level to pull date of diagnosis
+icd_diagnosis.data <- icd_diagnosis.data %>%
+  mutate(
+    # Check if any diagnosis matches the inclusion pattern after exclusion of exact patterns
+    cirrhosis_desc_date = if_else(
+      str_detect(diagnosis_description, include_pattern) & 
+        !str_detect(diagnosis_description, exclude_pattern),
+      earliest_diagnosis,  # Date if any diagnosis matches after exclusion
+      as.Date(NA)   # NA if none of the diagnoses match
+    )
+  )
+
+
+# Check unique patients who have diagnosis in keeping cirrhosis
+
+table(icd_diagnosis.data$cirrhosis_desc)
+icd_diagnosis.data %>%
+  group_by(cirrhosis_desc) %>%
+  summarise(patient_count = n_distinct(study_subject_id)) -> cirrhosis_by_desc # 3389 patients have a diagnosis that meets inclusion criteria after applying exclusion criteria (by both methods!!!)
+
+# check what descriptions (when looking at individual diagnoses)
+icd_diagnosis.data %>%
+  filter(cirrhosis_desc == 1) %>%
+  group_by(diagnosis_description) %>%
+  summarise(observations = n()) -> cirrhosis_description_count 
+
+# tidy environment
+rm(cirrhosis_by_desc, cirrhosis_description_count)
+
+
+
+# 3. Snomedct ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+table(icd_diagnosis.data$snomed_code)
+
+# original snomedct codes (n= 294)
+#snomed_cirrho <- "72541600|707420003|776981000000103|1010616001|78208005|109819003|111370006|123604002|123716002|197291001|197301006|197553002|19943007|235894003|235896001|266469006|271440004|308129003|309783001|
+#1082601000119104|1092801000119102|123605001|123606000|12368000|123717006|128072003|15999000|16070004|197293003|197294009|197296006|197299004|197303009|197305002|197306001|197362001|21861000|235895002|
+#235897005|266468003|266470007|266471006|27156006|33144001|347891000119103|371139006|37688005|419728003|420054005|43904005|45256007|470971000000107|589551000000103|671731000000104|699189004|702377007|
+#710066005|710067001|725938001|735733008|74669004|831000119103|86454000|871619002|89580002|897004000|1259465009|1263507006|235886005|1197694007|1197696009|1197697000|1197698005|1197700001|1197736003|
+#197279005|24807004|235881000|34742003|59927004|14223005|173617001|173621008|173661009|195476002|213230009|213231008|906081000006105|399126000|28670008|173660005|197284004|29633007|17709002|195474004|
+#173641003|51292008|173639004|197300007|195475003|67364009|88469006|675401000000103|1763641000006109|173679008|13920009|20415001|303082009|123604002|12368000|14223005|15999000|173617001|589511000000102|
+#235880004|41309000|307757001|235899008|235901004|1082611000119101|1085021000119106|1085091000119108|146371000119104|149322009|149326007|149327003|153091000119109|155479001|155809006|155811002|155814005|
+#155821005|16093661000119105|173618006|173622001|173623006|188446007|195473005|195477006|195478001|195479009|195483009|195643006|197280008|197290000|197292008|197295005|197298007|197302004|197307005|
+#197308000|197309008|197311004|235184005|235201007|235212007|235213002|235891006|235892004|236004002|236067006|264974007|265349006|265863006|266467008|266472004|266537000|312980002|38436007|417371000000102|
+#424340000|446739005|446742004|449902003|59701000119109|62216007|652571000000102|663501000000108|696141000000105|699074005|713652000|721160006|721206006|722867009|73282006|75393009|764962002|843571000000100|
+#426841006|173621008|173639004|173641003|173660005|173661009|17709002|195474004|195475003|195476002|197279005|197291001|197293003|197294009|197296006|197299004|197300007|197301006|197303009|197305002
+##|197310003|197362001|19943007|20415001|213231008|21861000|235881000|235886005|235895002|235896001|235897005|266468003|266469006|266470007|266471006|271440004|28670008|308129003|309783001|34742003|419728003|
+#426841006|43904005|51292008|67364009|7.77E+14|91109007|1.24E+15|230364000|91109007|22508003|713542007|717865007|227071000000107|256971000000107|662331000000101|1148573000|1197664001|31005002|13124004|
+#140519000|140521005|140522003|140523008|140524002|150557006|158530005|163309001|163311005|163312003|163313008|163314002|178012008|178013003|178014009|207252009|207254005|274433001|302455000|307311001|
+#389026000|397041000000101|442039000|470757009|470758004|499461000000105|533781000000107|539081000000106|89305009"
+
+# 245 unique codes (removed 49 repeats)
+snomed_cirrho <- "72541600|707420003|776981000000103|1010616001|78208005|109819003|111370006|123604002|123716002|197291001|197301006|197553002|19943007|235894003|235896001|266469006|271440004|308129003|309783001|425413006|536002|589541000000101|589561000000100|6183001|662341000000105|708248004|710065009|715864007|716203000|725939009|725940006|76301009|778131000000103|897005004|103611000119102|10690671000119109|1082601000119104|1092801000119102|123605001|123606000|12368000|123717006|128072003|15999000|16070004|197293003|197294009|197296006|197299004|197303009|197305002|197306001|197362001|21861000|235895002|235897005|266468003|266470007|266471006|27156006|33144001|347891000119103|371139006|37688005|419728003|420054005|43904005|45256007|470971000000107|589551000000103|671731000000104|699189004|702377007|710066005|710067001|725938001|735733008|74669004|831000119103|86454000|871619002|89580002|897004000|1259465009|1263507006|235886005|1197694007|1197696009|1197697000|1197698005|1197700001|1197736003|197279005|24807004|235881000|34742003|59927004|14223005|173617001|173621008|173661009|195476002|213230009|213231008|906081000006105|399126000|28670008|173660005|197284004|29633007|17709002|195474004|173641003|51292008|173639004|197300007|195475003|67364009|88469006|675401000000103|1763641000006109|173679008|13920009|20415001|303082009|589511000000102|235880004|41309000|307757001|235899008|235901004|1082611000119101|1085021000119106|1085091000119108|146371000119104|149322009|149326007|149327003|153091000119109|155479001|155809006|155811002|155814005|155821005|16093661000119105|173618006|173622001|173623006|188446007|195473005|195477006|195478001|195479009|195483009|195643006|197280008|197290000|197292008|197295005|197298007|197302004|197307005|197308000|197309008|197311004|235184005|235201007|235212007|235213002|235891006|235892004|236004002|236067006|264974007|265349006|265863006|266467008|266472004|266537000|312980002|38436007|417371000000102|424340000|446739005|446742004|449902003|59701000119109|62216007|652571000000102|663501000000108|696141000000105|699074005|713652000|721160006|721206006|722867009|73282006|75393009|764962002|843571000000100|426841006|7.77E+14|91109007|1.24E+15|230364000|22508003|713542007|717865007|227071000000107|256971000000107|662331000000101|1148573000|1197664001|31005002|13124004|140519000|140521005|140522003|140523008|140524002|150557006|158530005|163309001|163311005|163312003|163313008|163314002|178012008|178013003|178014009|207252009|207254005|274433001|302455000|307311001|389026000|397041000000101|442039000|470757009|470758004|499461000000105|533781000000107|539081000000106|89305009"
+
+
+pattern <- regex(snomed_cirrho, ignore_case = T) 
+
+# At individual snomed code level -> to generate binary indicator variable 1 or 0
+icd_diagnosis.data <- icd_diagnosis.data %>%
+  mutate(
+    # Check if any snomedct matches the pattern
+    cirrhosis_snomed = if_else(
+      str_detect(snomed_code, pattern),
+      1L,  # Snomed cirrho code match
+      0L   # No snomed cirrho code match
+    )
+  )
+
+# At individual snomed code level -> to pull date of diagnosis
+icd_diagnosis.data <- icd_diagnosis.data %>%
+  mutate(
+    # Check if any snomedct matches the pattern
+    cirrhosis_snomed_date = if_else(
+      str_detect(snomed_code, pattern),
+      earliest_diagnosis,  # Snomed cirrho code match
+      as.Date(NA)   # No snomed cirrho code match
+    )
+  )
+
+# Check unique patients who have snomed code in keeping cirrhosis
+
+table(icd_diagnosis.data$cirrhosis_snomed)
+icd_diagnosis.data %>%
+  group_by(cirrhosis_snomed) %>%
+  summarise(patient_count = n_distinct(study_subject_id)) -> cirrhosis_by_snomed # 184 patients have a snomed cirrhosis code
+
+# check what descriptions (when looking at individual diagnoses)
+icd_diagnosis.data %>%
+  filter(cirrhosis_snomed == 1) %>%
+  group_by(snomed_code) %>%
+  summarise(observations = n()) -> cirrhosis_snomed_count
+
+# tidy environment
+rm(cirrhosis_by_snomed, cirrhosis_snomed_count)
+
+
+## Group at patient level 
+# Columns for icd/desc/snomed diagnosis and date of each
+# Additional column with cirrhosis diagnosis (any) and earliest date of recorded diagnosis
+
+# Group by patient_id and aggregate using max to set to 1 if any observation meets inclusion (1)
+cirrho_code_pt <- icd_diagnosis.data %>%
+  group_by(study_subject_id) %>%
+  summarise(
+    ptcirrhosis_icd = max(cirrhosis_icd, na.rm = FALSE),
+    ptcirrhosis_desc = max(cirrhosis_desc, na.rm = FALSE),
+    ptcirrhosis_snomed = max(cirrhosis_snomed, na.rm = FALSE),
+    date_diagnosis = if_else(all(is.na(c(cirrhosis_icd_date,cirrhosis_desc_date,cirrhosis_snomed_date))), 
+                             NA,  # Replace Inf with NA if all dates are missing
+                             as.Date(min(c(cirrhosis_icd_date,cirrhosis_desc_date,cirrhosis_snomed_date), na.rm = TRUE))),  # Get the earliest date if not all NA 
+    ptcirrhosis = if_else(max(c(cirrhosis_icd,cirrhosis_desc,cirrhosis_snomed),na.rm=T) == 1, 1, 0)
+  )
+
+# View the result
+print(cirrho_code_pt)
+table(cirrho_code_pt$ptcirrhosis) # 5302 with recorded coded diagnosis in keeping cirrhosis
+
+# How many have no diagnosis date
+cirrho_missing_date <- cirrho_code_pt %>%
+  group_by(ptcirrhosis) %>%
+  summarise(na_count = sum(is.na(date_diagnosis))) # n= 126 pt with cirrhosis missing date of recorded diagnosis
+
+# For merge
+cirrho_cohort_diagnosis <- cirrho_code_pt %>%
+  select (-c(ptcirrhosis_icd,ptcirrhosis_desc,ptcirrhosis_snomed)) %>%
+  filter(ptcirrhosis ==1 )
+
+# tidy environment
+rm(cirrho_missing_date)
+
+# CIRRHO COHORT = ALL PATIENTS WITH CIRRHOSIS DIAGNOSIS AT ANY TIME n = 5302
+
+
+# Extract age  -----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+# Create d.f. with all pt w/ cirrhosis diagnosis and date of liver Tx (if any)
+
+cirrho_cohort_diagnosis_birth <- cirrho_cohort_diagnosis %>%
+  left_join(Demographics.data %>% select(study_subject_id, year_of_birth),
+            by = 'study_subject_id'
+  )
+
+# Add year turns 18 (ie potential filter for results only after that year)
+
+cirrho_cohort_diagnosis_age <- cirrho_cohort_diagnosis_birth %>%
+  mutate(
+    year_18 = year_of_birth + 18,
+    cutoff_date_18 = make_date(year_18, 12, 31)
+  ) %>%
+  select(-c(year_18, year_of_birth, ptcirrhosis))
+
+rm(cirrho_cohort_diagnosis_birth)
+
+
+# Liver transplant extraction -----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+# SNOMED codes to include (numeric)
+snomed_tx_keep <- c(
+  18027006, 27280000, 28009009, 33167004, 737297006, 174425003, 174426002,
+  174427006, 213153001, 235910007, 235911006, 235912004, 316061004, 426356008,
+  428198008, 431222008, 432772009, 432777003, 432908002, 702777009,
+  226941000000100, 226951000000102, 233331000000102, 257811000000106,
+  257821000000100, 464381000000109, 538521000000107, 595961000000105,
+  853761000000103, 885861000000104
+)
+
+# Patterns
+desc_anyorder <- regex(
+  "(liver.*transplant|transplant.*liver|hepat.*transplant|transplant.*hepat)",
+  ignore_case = TRUE
+)
+desc_pre <- regex("pre[-\\s]?transplant|await|planned", ignore_case = TRUE)
+icd_pat  <- regex("T86\\.?4|T864|Z94\\.?4|Z944", ignore_case = TRUE) 
+# icd 10 codes  T86.4    T864   Z94.4    Z944
+#  NOT  Z76.8 (Z76.82 awaiting) or Z01.8 (non-specific examination) or IMO0001 (invalid)
+
+icd_diagnosis.data_transplant <- icd_diagnosis.data %>%
+  filter(
+    # description path: must match the liver/hepat + transplant pattern,
+    # but NOT contain "pre-transplant"
+    (
+      coalesce(str_detect(diagnosis_description, desc_anyorder), FALSE) &
+        !coalesce(str_detect(diagnosis_description, desc_pre), FALSE)
+    ) |
+      # OR ICD path: contains any of the target codes (dot optional)
+      coalesce(str_detect(as.character(icd_code), icd_pat), FALSE) |
+      # OR SNOMED path: code is in the provided list
+      (snomed_code %in% snomed_tx_keep)
+  )
+
+
+# Add all description relevant to liver transplant to cirrho cohort
+# Convert both data frames to data.tables
+setDT(icd_diagnosis.data_transplant)
+setDT(cirrho_cohort_diagnosis)
+
+# Subset cirrho_cohort to only required columns
+cirrho_cohort_subset <- cirrho_cohort_diagnosis[, .(study_subject_id, date_diagnosis)]
+
+# Subset icd transplant data to only required columns
+icd_diagnosis.data_transplant_subset <- icd_diagnosis.data_transplant[, .(study_subject_id, diagnosis_date, icd_code, snomed_code, diagnosis_description)]
+
+# Perform efficient join and filtering
+cirrho_transplant_cirrhosis <- icd_diagnosis.data_transplant_subset[cirrho_cohort_subset, on = "study_subject_id"]
+
+# Check all cirrho patients included (n = 5302)
+length(unique(cirrho_transplant_cirrhosis$study_subject_id))
+
+# Check what descriptions/icd codes/ snomed codes
+table(cirrho_transplant_cirrhosis$diagnosis_description)
+table(cirrho_transplant_cirrhosis$icd_code)
+table(cirrho_transplant_cirrhosis$snomed_code)
+
+# If diagnosis_date is a proper NA (not the string "NA")
+cirrho_transplant_cirrhosis %>%
+  group_by(study_subject_id) %>%
+  summarise(all_dates_na = all(is.na(diagnosis_date)), .groups = "drop") %>%
+  filter(all_dates_na) %>%
+  summarise(n_patients = n())
+# n = 4627 so 675 patients have record relating to a liver transplant
+
+# Endoffu should be date of liver transplant date IF earliest liver transplant is AFTER diagnosis of cirrhosis
+
+# Merge earliest liver transplant record date with cirrho_cohort
+
+
+# If you want the earliest date from your previously filtered liver_tx_filtered:
+tx_dates <- cirrho_transplant_cirrhosis %>%
+  # Parse dates robustly if they're character; remove this line if already Date
+  mutate(diagnosis_date = as.Date(diagnosis_date)) %>%
+  filter(!is.na(diagnosis_date)) %>%
+  group_by(study_subject_id) %>%
+  summarise(date_transplant = min(diagnosis_date), .groups = "drop")
+
+# Merge onto your cirrhosis cohort (one row per study_subject_id)
+cirrho_cohort_diagnosis_age_transplant <- cirrho_cohort_diagnosis_age %>%
+  left_join(tx_dates, by = "study_subject_id")
+
+# Add last data extract date
+cirrho_cohort_diagnosis_age_transplant <- cirrho_cohort_diagnosis_age_transplant %>%
+  mutate(extract_date = dmy("31/08/2024"))
+
+# Final cirrho cohort
+cirrho_cohort <- cirrho_cohort_diagnosis_age_transplant %>%
+  filter(cutoff_date_18 < extract_date)
+# patients not 18 by last data extract n = 1 
+
+# CIRRHO COHORT WITH AGE 18 CUTOFF AND TX DATE = ALL PATIENTS WITH EARLIEST CIRRHOSIS DIAGNOSIS, DATE AGED 18 PLUS EARLIEST RECORDED TRANSPLANT DATE n = 5301
+
+
+## CLEAN VARIABLES OF INTEREST -----------------------------------------------------------------------------------------------------------------------------------------------------------
+### Demographics ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+# Unique study ID within demographics
+length(unique(Demographics.data$study_subject_id))
+
+#### Ethnicity 
+
+# Table of ethnic code id
+table(Demographics.data$ethnic_code_id)
+
+library(data.table)
+setDT(Demographics.data)
+Demographics.data[, ethnic_group := fcase(
+  ethnic_code_id %in% c('A','B','C'), 'White',
+  ethnic_code_id %in% c('D','E','F','G'), 'Mixed',
+  ethnic_code_id %in% c('H','J','K','L','R'), 'Asian',
+  ethnic_code_id %in% c('M','N','P'), 'Black',
+  ethnic_code_id %in% c('S'), 'Other',
+  ethnic_code_id %in% c('Z','99'), 'Not stated'
+)]
+table(Demographics.data$ethnic_group)
+
+#### Gender 
+
+table(Demographics.data$gender_id)
+Demographics.data$gender_id_uncoded <- gsub('1|M|Male', 'Male',Demographics.data$gender_id)
+Demographics.data$gender_id_uncoded <- gsub('2|F|Female', 'Female',Demographics.data$gender_id_uncoded)
+Demographics.data$gender_id_uncoded <- gsub('9', 'Indeterminate',Demographics.data$gender_id_uncoded)
+Demographics.data$gender_id_uncoded <- gsub('X', 'Not Known',Demographics.data$gender_id_uncoded)
+table(Demographics.data$gender_id_uncoded)
+
+# For merge 
+m_demographics <- Demographics.data %>%
+  select(study_subject_id, year_of_birth, ethnic_group, gender_id_uncoded)
+
+
+# Filter demographics to those who have cirrhosis
+cirrho_demographics <- m_demographics %>%
+filter(study_subject_id %in% cirrho_cohort$study_subject_id)
+
+# NB no gender indeterminate or missing
+
+# Tidy environment
+rm(Demographics.definitions)
+
+### Risk factors ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+# Extract those of cirrhosis cohort
+riskfactor_cirrho <- riskfactor.data %>%
+  filter(study_subject_id %in% cirrho_cohort$study_subject_id)
+
+table(riskfactor_cirrho$name_id)
+
+# Convert date and value_numeric
+riskfactor_cirrho <- riskfactor_cirrho %>%
+  mutate(date = as.Date(date_risk_factor_recorded),
+         final_value = as.numeric(value_numeric) )
+
+# Explore alcohol consumption
+alcohol_cirrho <- riskfactor_cirrho %>%
+  filter(name_id == 'Alcohol')
+
+# Alcohol data very hetergenous - unsure of validity
+
+# Explore smoking status 
+smoking_cirrho <- riskfactor_cirrho %>%
+  filter(name_id == 'Smoking') # %>%
+  # summarise(n_distinct(study_subject_id)) # n = 1,769
+
+# Smoking data could be categorised into 2/1/0 smoker/ex-smoker/non-smoker - unsure of clinical utility 
+# and at least 50% will be missing
+table(smoking_cirrho$value)
+
+
+# Explore bmi data
+bmi_cirrho <- riskfactor_cirrho %>%
+  filter(name_id == 'BMI') #%>%
+ #summarise(n_distinct(study_subject_id)) # n = 3,428
+
+summary(bmi_cirrho$final_value)
+hist(bmi_cirrho$final_value)
+
+bmi_cirrho <- bmi_cirrho %>%
+  filter(final_value <= 150)
+n_distinct(bmi_cirrho$study_subject_id) # n = 3,296
+
+bmi_cirrho <- bmi_cirrho %>%
+  filter(final_value >= 5)
+n_distinct(bmi_cirrho$study_subject_id) # n =3,285
+  
+hist(bmi_cirrho$final_value)  
+
+# Could explore BMI as covariate
+
+
+
+### Lab tests all ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+# Extract those of cirrhosis cohort
+labtest_cirrho <- Labtest.data %>%
+  filter(study_subject_id %in% cirrho_cohort$study_subject_id)
+
+# Unique study ID within lab tests
+length(unique(labtest_cirrho$study_subject_id)) # 3,154,986 obs Nov 2024 # n = 5,266 unique patients
+
+#Date and time 
+sum(is.na(labtest_cirrho$date_time))
+
+# Convert to Date and Time format and columns
+labtest_cirrho <- labtest_cirrho %>%
+  mutate(
+    Date = as.Date(ymd_hms(date_time)),  # Extract the date part
+    Time = format(ymd_hms(date_time), "%H:%M:%S")  # Extract the time part
+  )
+
+#Relocate so date and time follow date_time
+labtest_cirrho <- labtest_cirrho %>% 
+  relocate("Date", .after="date_time")
+labtest_cirrho <- labtest_cirrho %>% 
+  relocate("Time", .after="Date")
+
+# Remove ymd_hms(date_time) colum
+labtest_cirrho %>%
+  dplyr::select(-`date_time`) -> labtest_cirrho
+
+# NOT YET Filter for all lab test data following or 90 days prior to cirrhosis diagnosis per patient
+
+# Convert both data frames to data.tables
+# setDT(labtest_cirrho)
+# setDT(cirrho_cohort)
+
+# Subset cirrho_cohort to only required columns
+# cirrho_cohort_subset <- cirrho_cohort[, .(study_subject_id, date_diagnosis)]
+
+# Perform efficient join and filtering
+# labtest_cirrho_during_study <- labtest_cirrho[cirrho_cohort_subset, 
+#                                          on = "study_subject_id"][Date >= (date_diagnosis - 90)]
+
+# Unique study ID within lab tests filtered
+# length(unique(labtest_cirrho_during_study$study_subject_id)) # n = 5077
+
+
+
+
+### Haemoglobin ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+#Create new data set with only HB 
+
+cirrho_hb <- filter(labtest_cirrho, test_name_id == "HB")
+length(unique(cirrho_hb$study_subject_id))
+
+# Show missing value counts
+missing_counts <- colSums(is.na(cirrho_hb))
+print(missing_counts)
+rm(missing_counts)
+
+##### Combine HB results 
+
+# Remove non-numeric characters except decimals and turn to numeric
+
+cirrho_hb <- cirrho_hb %>%
+  mutate(
+    result = as.numeric(gsub("[^0-9.]", "", result)), 
+    result_numerical = as.numeric(gsub("[^0-9.]", "", result_numerical))
+  )
+
+
+# Check if results columns are identical 
+# (ignoring NA)
+
+# Number of HB results where result and numerical match
+cirrho_hb <- cirrho_hb %>% 
+  mutate(HB_match = result == result_numerical)
+cirrho_hb$HB_match[is.na(cirrho_hb$HB_match)] <- FALSE
+table(cirrho_hb$HB_match)
+
+# Number of HB results where result and numerical both contain numerical values 
+# (i.e ignoring NA values)
+cirrho_hb <- cirrho_hb %>%
+  mutate(bothHB_numeric = complete.cases(result_numerical, result))
+table(cirrho_hb$bothHB_numeric)
+
+# Check that all cases where there are numerical HB results in result and
+# numerical also meet the condition that they are the same values
+
+cirrho_hb <- cirrho_hb %>% 
+  mutate(HB_both_true = ifelse(HB_match & bothHB_numeric, TRUE, FALSE))
+table(cirrho_hb$HB_both_true)
+
+#Success! The 169837 Hb values entered into both result and result_numerical 
+#are the same
+
+#Can safely merge result (numerical form of result) and result_numerical 
+#columns to generate merged Hb list (as all those unmatched are due to no numerical value in one column)
+cirrho_hb$HB_merged <- coalesce(cirrho_hb$result, cirrho_hb$result_numerical)
+length(cirrho_hb$HB_merged)
+
+# Show missing value counts
+missing_counts <- colSums(is.na(cirrho_hb))
+print(missing_counts)
+rm(missing_counts)
+
+# Remove rows with missing Hb_merged value
+cirrho_hb <- cirrho_hb %>%
+  filter(!is.na(HB_merged))
+
+# Drop unecessary columns
+cirrho_hb <- cirrho_hb %>%
+  select(study_subject_id, test_name_id, Date, Time, HB_merged, units, lower_reference_value, lower_reference_value_numerical, upper_reference_value, upper_reference_value_numerical)
+
+##### Reference ranges
+## To aid downstream subsetting 
+## Merge upper and lower ref values to make one numeric column for each
+
+# Check and ref ranges which will lose numeric in mutate
+table(cirrho_hb$lower_reference_value)
+table(cirrho_hb$lower_reference_value_numerical)
+table(cirrho_hb$upper_reference_value)
+table(cirrho_hb$upper_reference_value_numerical)
+
+# First convert upper reference and lower reference to numerical 
+cirrho_hb <- cirrho_hb %>% 
+  mutate(lower_ref_numeric1 = as.numeric(lower_reference_value))
+cirrho_hb <- cirrho_hb %>% 
+  mutate(upper_ref_numeric1 = as.numeric(upper_reference_value))
+cirrho_hb <- cirrho_hb %>% 
+  mutate(lower_ref_numeric2 = as.numeric(lower_reference_value_numerical))
+cirrho_hb <- cirrho_hb %>% 
+  mutate(upper_ref_numeric2 = as.numeric(upper_reference_value_numerical))
+
+# Check ref ranges where ref_numeric1 and ref_numeric2 match
+
+# Lower
+cirrho_hb <- cirrho_hb %>% 
+  mutate(Lower_ref_match = lower_ref_numeric1 == lower_ref_numeric2)
+cirrho_hb$Lower_ref_match[is.na(cirrho_hb$Lower_ref_match)] <- FALSE
+table(cirrho_hb$Lower_ref_match)
+
+#Upper
+cirrho_hb <- cirrho_hb %>% 
+  mutate(Upper_ref_match = upper_ref_numeric1 == upper_ref_numeric2)
+cirrho_hb$Upper_ref_match[is.na(cirrho_hb$Upper_ref_match)] <- FALSE
+table(cirrho_hb$Upper_ref_match)
+
+# Number of ref results where ref_numeric1 and ref_numeric2 both contain 
+#numerical values (i.e ignoring NA values)
+
+#Lower
+cirrho_hb <- cirrho_hb %>%
+  mutate(both_lowerref_numeric = complete.cases(lower_ref_numeric1, lower_ref_numeric2))
+table(cirrho_hb$both_lowerref_numeric)
+
+#Upper
+cirrho_hb <- cirrho_hb %>%
+  mutate(both_upperref_numeric = complete.cases(upper_ref_numeric1, upper_ref_numeric2))
+table(cirrho_hb$both_upperref_numeric)
+
+# Check that all cases where numerical ref range results in both ref_numeric1
+# and ref_numeric2 also meet the condition that they are the same values
+
+#Lower
+cirrho_hb <- cirrho_hb %>% 
+  mutate(Lowerref_both_true = ifelse(Lower_ref_match & both_lowerref_numeric, TRUE, FALSE))
+table(cirrho_hb$Lowerref_both_true)
+
+#Upper
+cirrho_hb <- cirrho_hb %>% 
+  mutate(Upperref_both_true = ifelse(Upper_ref_match & both_upperref_numeric, TRUE, FALSE))
+table(cirrho_hb$Upperref_both_true)
+
+#Success! The 115269 ref range values entered into both ref range columns are 
+#the same for both lower and upper ref ranges
+
+#Can safely merge ref ranges (numerical form) for lower and upper columns to 
+#generate single merged ref range
+
+#Lower
+cirrho_hb$Lowerref_merged <- coalesce(cirrho_hb$lower_ref_numeric1, cirrho_hb$lower_ref_numeric2)
+length(cirrho_hb$Lowerref_merged)
+table(cirrho_hb$Lowerref_merged)
+
+#Upper
+cirrho_hb$Upperref_merged <- coalesce(cirrho_hb$upper_ref_numeric1, cirrho_hb$upper_ref_numeric2)
+length(cirrho_hb$Upperref_merged)
+table(cirrho_hb$Upperref_merged)
+
+# Select columns required
+cirrho_hb <- cirrho_hb %>%
+  select(-c(lower_reference_value, lower_reference_value_numerical, upper_reference_value, upper_reference_value_numerical, lower_ref_numeric1, lower_ref_numeric2, Lower_ref_match, Lowerref_both_true, upper_ref_numeric1, upper_ref_numeric2, Upper_ref_match, Upperref_both_true, both_lowerref_numeric, both_upperref_numeric))
+
+##### Units 
+## All Hb values need to be in the same unit form of g/L
+table(cirrho_hb$units)
+
+# Check CC_UM_G/L values
+cirrho_hb_um <- cirrho_hb %>%
+  filter(units=='CC_UM_G/L')
+summary(cirrho_hb_um)
+hist(cirrho_hb_um$HB_merged)
+rm(cirrho_hb_um) # all inkeeping g/L
+
+# Change all l to L
+cirrho_hb$units <- gsub('l','L',cirrho_hb$units)
+table(cirrho_hb$units)
+
+# Change all CC_UM_G/L to g/L
+cirrho_hb$units <- gsub('CC_UM_G/L','g/L',cirrho_hb$units)
+table(cirrho_hb$units)
+
+
+## Identify Hb values where g/dL CORRECT and INCORRECT
+
+# New df with all values g/dL
+cirrho_hb_gdL <- cirrho_hb[cirrho_hb$units == 'g/dL', ]
+hist(cirrho_hb_gdL$HB_merged)
+
+# If Hb <30 and units g/dL likely CORRECT, convert to g/L and * 10
+cirrho_hb <- cirrho_hb %>%
+  mutate(HB_mod1 = if_else(HB_merged < 30 & units == "g/dL", HB_merged * 10, HB_merged),
+         units_mod1 = if_else(HB_merged < 30 & units == "g/dL","g/L", units))
+
+# Review df with all values g/dL
+cirrho_hb_gdL <- cirrho_hb[cirrho_hb$units_mod1 == 'g/dL', ]
+hist(cirrho_hb_gdL$HB_merged)
+
+# Hb g/dL likely INCORRECT if result outside biologically plausible range (>30g/dL) n = 44,668
+
+# Count values where Hb >=30 g/dL AND upper and lower reference value in keeping g/L 
+cirrho_hb_gdL <- cirrho_hb_gdL %>% 
+  mutate(HB30_ref_gL = if_else(Upperref_merged > 100 & Lowerref_merged > 100, TRUE, FALSE, missing = NA))
+table(cirrho_hb_gdL$HB30_ref_gL,useNA = 'always')
+
+# check values where return is NA
+cirrho_hb_gdL_NA <- cirrho_hb_gdL %>%
+  filter(is.na(HB30_ref_gL))
+rm(cirrho_hb_gdL_NA)
+
+# Counts: 44,665 of 44,668 values Hb >30 have ref range values in keeping g/L (i.e >100)
+# remaining 3 Hb >30 have no reference ranges but Hb values in keeping g/L
+# NO recorded values HB >30 g/dL have reference ranges for g/dL
+
+# ALL HB >30 G/DL TREATED AS G/L
+
+cirrho_hb <- cirrho_hb %>%
+  mutate(units_mod1 = if_else(units_mod1=='g/dL','g/L',units_mod1) )
+table(cirrho_hb$units_mod1)
+
+# Remove unuecessary d.f
+rm(cirrho_hb_gdL)
+
+
+# REVIEW VALUES WITH NO UNITS
+
+# Merge no units into NULL
+cirrho_hb <- cirrho_hb %>%
+  mutate(units_mod1 = if_else(units_mod1=='','NULL',units_mod1))
+table(cirrho_hb$units_mod1)
+
+# New d.f of results with NULL units
+cirrho_hb_null <- cirrho_hb %>%
+  filter(units_mod1 == 'NULL')
+summary(cirrho_hb_null)
+hist(cirrho_hb_null$HB_mod1)
+
+# In those with units = NULL: Hb value < 20 * 10, if >= 20 keep n = 64,574
+cirrho_hb <- cirrho_hb %>%
+  mutate(HB_mod2 = if_else(HB_mod1 <20 & units_mod1 == 'NULL',HB_mod1*10,HB_mod1),
+         units_mod2 = if_else(units_mod1=='NULL','g/L',units_mod1))
+
+# Tidy d.f 
+rm(cirrho_hb_null)
+cirrho_hb <- cirrho_hb %>%
+  select(study_subject_id, test_name_id, Date, HB_mod2, units_mod2) %>%
+  dplyr::rename(hb_value = HB_mod2,
+         units = units_mod2)
+
+
+##### Spurious results, outliers, and missing data 
+summary(cirrho_hb)
+
+# Remove clinically unfeasible values (>300g/L or <20 g/L)
+cirrho_hb <- cirrho_hb %>%
+  filter(hb_value <= 300 & hb_value >=20) # n = 
+
+summary(cirrho_hb)
+
+# Show missing value counts
+missing_counts <- colSums(is.na(cirrho_hb))
+print(missing_counts)
+rm(missing_counts)
+
+####Final HB data frame for ML analysis
+cirrho_hb_during_study <- cirrho_hb
+rm(cirrho_hb)
+
+summary(cirrho_hb_during_study)
+hist(cirrho_hb_during_study$hb_value)
+length(unique(cirrho_hb_during_study$study_subject_id))
+
+
+### Ferritin ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+#### Ferritin (CFER) 
+labtest_cirrho %>%
+  filter(test_name_id == "CFER") -> Labtest_CFER
+length(unique(Labtest_CFER$study_subject_id)) # n = 4377
+
+##### Combine CFER results
+
+table(Labtest_CFER$result)
+sum(is.na(Labtest_CFER$result))
+table(Labtest_CFER$result_numerical)
+sum(is.na(Labtest_CFER$result_numerical))
+
+# 2 columns with CFER results - result and result_numerical
+# view non-numeric contents of CFER result and result_numerical
+# Filter for non-numerical data using grepl
+non_numeric_CFER_data <- Labtest_CFER$result[!grepl("^[0-9.]+$", Labtest_CFER$result)]
+non_numeric_CFER_data2 <- Labtest_CFER$result_numerical[!grepl("^[0-9.]+$", Labtest_CFER$result_numerical)|is.na(Labtest_CFER$result_numerical)]
+
+# Create a table of non-numerical values
+table(non_numeric_CFER_data)
+table(non_numeric_CFER_data2)
+
+# Create new column of result (character) to result (numerical) 
+
+# NB No. (159) of "result" contained > or < which need to be flagged as may bias descriptive stats
+count <- sum(grepl("[<>]", Labtest_CFER$result))
+count
+Labtest_CFER_bound <- Labtest_CFER[grepl("[<>]", Labtest_CFER$result), ]
+
+# Exclude if bound does not commit result to group n=2 (<1300)
+Labtest_CFER$result <- if_else(Labtest_CFER$result =='<1300', NA, Labtest_CFER$result)
+count <- sum(grepl("[<>]", Labtest_CFER$result))
+count
+
+# Where result value contains bound (157 results after removing 2 = '<1300', Nov 2024), make new variable to flag CFER_bound
+Labtest_CFER$CFER_bound <- if_else(grepl("[<>]", Labtest_CFER$result), T, F, F)
+
+#Now convert result and result_numerical into numerical
+Labtest_CFER <- Labtest_CFER %>%
+  mutate(Result2 = as.numeric(gsub("<|>", "", result, ignore.case = T)))
+sum(is.na(Labtest_CFER$Result2))
+
+sum(is.na(Labtest_CFER$result_numerical))
+Labtest_CFER <- Labtest_CFER %>%
+  mutate(result_numerical = as.numeric(result_numerical))
+sum(is.na(Labtest_CFER$result_numerical))
+
+# Now we have 2 numerical columns of results and can find if they are identical 
+# (ignoring NA)
+
+# Number of CFER results where Result2 and result_numerical match
+Labtest_CFER <- Labtest_CFER %>% 
+  mutate(CFER_match = Result2 == result_numerical)
+table(Labtest_CFER$CFER_match)
+
+# As there are no FALSE values, suggests that wherever both contain numeric value, they are the same. 
+# Therefore removed step performed with HB to convert NAs to FALSE 
+
+# Number of FER results where Result2 and result_numerical both contain numerical values 
+# (i.e ignoring NA values)
+Labtest_CFER <- Labtest_CFER %>%
+  mutate(bothCFER_numeric = complete.cases(result_numerical, Result2))
+table(Labtest_CFER$bothCFER_numeric)
+
+# Check that all cases where there are numerical FER results in Result2 and
+# numerical also meet the condition that they are the same values
+
+Labtest_CFER <- Labtest_CFER %>% 
+  mutate(CFER_both_true = ifelse(CFER_match & bothCFER_numeric, TRUE, FALSE))
+table(Labtest_CFER$CFER_both_true)
+
+#Success! The 16880 CFER values entered into both result and result_numerical 
+#are the same
+
+#Can safely merge result2 (numerical form of result) and result_numerical 
+#columns to generate merged CFER list
+Labtest_CFER$CFER_merged <- coalesce(Labtest_CFER$Result2, Labtest_CFER$result_numerical)
+length(Labtest_CFER$CFER_merged)
+sum(is.na(Labtest_CFER$CFER_merged))
+
+##### Reference ranges
+
+# Check any ref ranges which will lose numeric in mutate
+table(Labtest_CFER$lower_reference_value)
+table(Labtest_CFER$lower_reference_value_numerical)
+table(Labtest_CFER$upper_reference_value)
+table(Labtest_CFER$upper_reference_value_numerical)
+
+## Merge upper and lower ref values to make one numeric column for each
+
+# First convert upper reference and lower reference to numerical 
+Labtest_CFER <- Labtest_CFER %>% 
+  mutate(lower_ref_numeric1 = as.numeric(lower_reference_value))
+Labtest_CFER <- Labtest_CFER %>% 
+  mutate(upper_ref_numeric1 = as.numeric(upper_reference_value))
+Labtest_CFER <- Labtest_CFER %>% 
+  mutate(lower_ref_numeric2 = as.numeric(lower_reference_value_numerical))
+Labtest_CFER <- Labtest_CFER %>% 
+  mutate(upper_ref_numeric2 = as.numeric(upper_reference_value_numerical))
+
+# Check ref ranges where ref_numeric1 and ref_numeric2 match
+
+# Lower
+Labtest_CFER <- Labtest_CFER %>% 
+  mutate(Lower_ref_match = lower_ref_numeric1 == lower_ref_numeric2)
+Labtest_CFER$Lower_ref_match[is.na(Labtest_CFER$Lower_ref_match)] <- FALSE
+table(Labtest_CFER$Lower_ref_match)
+
+#Upper
+Labtest_CFER <- Labtest_CFER %>% 
+  mutate(Upper_ref_match = upper_ref_numeric1 == upper_ref_numeric2)
+Labtest_CFER$Upper_ref_match[is.na(Labtest_CFER$Upper_ref_match)] <- FALSE
+table(Labtest_CFER$Upper_ref_match)
+
+# Number of ref results where ref_numeric1 and ref_numeric2 both contain 
+#numerical values (i.e ignoring NA values)
+
+#Lower
+Labtest_CFER <- Labtest_CFER %>%
+  mutate(both_lowerref_numeric = complete.cases(lower_ref_numeric1, lower_ref_numeric2))
+table(Labtest_CFER$both_lowerref_numeric)
+
+#Upper
+Labtest_CFER <- Labtest_CFER %>%
+  mutate(both_upperref_numeric = complete.cases(upper_ref_numeric1, upper_ref_numeric2))
+table(Labtest_CFER$both_upperref_numeric)
+
+# Check that all cases where numerical ref range results in both ref_numeric1
+# and ref_numeric2 also meet the condition that they are the same values
+
+#Lower
+Labtest_CFER <- Labtest_CFER %>% 
+  mutate(Lowerref_both_true = ifelse(Lower_ref_match & both_lowerref_numeric, TRUE, FALSE))
+table(Labtest_CFER$Lowerref_both_true)
+
+#Upper
+Labtest_CFER <- Labtest_CFER %>% 
+  mutate(Upperref_both_true = ifelse(Upper_ref_match & both_upperref_numeric, TRUE, FALSE))
+table(Labtest_CFER$Upperref_both_true)
+
+#Success! The 11657 ref range values entered into both ref range columns are 
+#the same for both lower and upper ref ranges
+
+#Can safely merge ref ranges (numerical form) for lower and upper columns to 
+#generate single merged ref range
+
+#Lower
+Labtest_CFER$Lowerref_merged <- coalesce(Labtest_CFER$lower_ref_numeric1, Labtest_CFER$lower_ref_numeric2)
+length(Labtest_CFER$Lowerref_merged)
+table(Labtest_CFER$Lowerref_merged)
+
+#Upper
+Labtest_CFER$Upperref_merged <- coalesce(Labtest_CFER$upper_ref_numeric1, Labtest_CFER$upper_ref_numeric2)
+length(Labtest_CFER$Upperref_merged)
+table(Labtest_CFER$Upperref_merged)
+
+##### Units
+table(Labtest_CFER$units,useNA = 'always')
+
+# Check mean of each units
+Labtest_CFER %>%
+  group_by(units) %>%
+  summarise(count= sum(!is.na(CFER_merged)), median(CFER_merged,na.rm = T)) -> CFER_units_medians # Medians are all within expected ranges if units ug/L for all
+
+
+# All forms of units equivalent to ug/l
+Labtest_CFER$units <- gsub('CC_UM_UG/L|micro g/L|microg/L|ng/mL|NULL|ug/l|UG/L','ug/L',Labtest_CFER$units)
+table(Labtest_CFER$units)
+sum(is.na(Labtest_CFER$units))
+
+
+##### Spurious results, outliers, and missing data 
+# Hard to determine upper limit of ferritin
+# 9 results >300,000
+
+# Try convert all >15,000
+# Also why reference ranges different?
+
+sum(is.na(Labtest_CFER$CFER_merged))
+
+# Total missing data = 237 values
+
+## USE COMPLETE CASE ANALYSIS 
+# Omit na.s from data frame
+Labtest_CFER %>%
+  filter(!is.na(CFER_merged)) -> CFER_noNA
+sum(is.na(CFER_noNA$CFER_merged))
+CFER_noNA %>% 
+  summary(study_subject_id)
+
+####Final CFER data frame for analysis
+cirrho_cfer_during_study <- CFER_noNA[,c('study_subject_id','test_name_id','Date','CFER_merged','units')]
+summary(cirrho_cfer_during_study)
+length(unique(cirrho_cfer_during_study$study_subject_id)) # n = 4356
+
+#Tidy d.fs
+rm(CFER_noNA, CFER_units_medians, Labtest_CFER_bound)
+
+
+### INR ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+table(labtest_cirrho$test_name)
+
+labtest_cirrho %>%
+  filter(test_name_id == "HINR") -> Labtest_HINR
+length(unique(Labtest_HINR$study_subject_id)) #n = 4852
+
+##### Combine HINR results
+table(Labtest_HINR$result)
+sum(is.na(Labtest_HINR$result))
+table(Labtest_HINR$result_numerical)
+sum(is.na(Labtest_HINR$result_numerical))
+
+# Filter for non-numerical data using grepl
+non_numeric_HINR_data <- Labtest_HINR$result[!grepl("^[0-9.]+$", Labtest_HINR$result)]
+non_numeric_HINR_data2 <- Labtest_HINR$result_numerical[!grepl("^[0-9.]+$", Labtest_HINR$result_numerical)|is.na(Labtest_HINR$result_numerical)]
+
+# Create a table of non-numerical values
+table(non_numeric_HINR_data)
+table(non_numeric_HINR_data2)
+
+# One HINR_result has a ,. Replace with.
+Labtest_HINR$result <- gsub(",", ".", Labtest_HINR$result)
+Labtest_HINR$result <- gsub(" ", "", Labtest_HINR$result)
+
+# NB No. (139) of "result" contained > or < which need to be flagged as may bias descriptive stats
+count <- sum(grepl("[<>]", Labtest_HINR$result))
+count
+Labtest_HINR_bound <- Labtest_HINR[grepl("[<>]", Labtest_HINR$result), ]
+
+# Require 2 columns with HINR results - result and result_numerical
+
+# All bounds commit result to group (<0.7 n=1, >8 n=138)
+
+# Where result value contains bound (all 138 results, Nov 2024), make new variable to flag HINR_bound
+Labtest_HINR$HINR_bound <- if_else(grepl("[<>]", Labtest_HINR$result), T, F, F)
+
+# And remove bound (>|<) to allow conversion to numerical
+Labtest_HINR$result <- gsub("<|>", "", Labtest_HINR$result)
+count <- sum(grepl("[<>]", Labtest_HINR$result))
+count
+
+# Now create new column of result (character) to result2 (numerical) 
+# AND result numerical to numerical
+
+Labtest_HINR <- Labtest_HINR %>%
+  mutate(Result2 = as.numeric(result))
+sum(is.na(Labtest_HINR$Result2))
+
+sum(is.na(Labtest_HINR$result_numerical))
+Labtest_HINR <- Labtest_HINR %>%
+  mutate(result_numerical = as.numeric(result_numerical))
+sum(is.na(Labtest_HINR$result_numerical)) # This is as expected from non-numeric data in this column (blank 38548 + NULL 7746 = 46294)
+
+# Now we have 2 numerical columns of results and can find if they are identicalwhere they contain values 
+# (i.e ignoring NA)
+
+# Number of INR results where Result2 and numerical match
+Labtest_HINR <- Labtest_HINR %>% 
+  mutate(HINR_match = Result2 == result_numerical)
+table(Labtest_HINR$HINR_match)
+
+# As there are no FALSE values, suggests that wherever both contain numeric value, they are the same. 
+# Therefore removed step performed with HB to convert NAs to FALSE 
+
+# Number of HINR results where Result2 and numerical both contain numerical values 
+# (i.e ignoring NA values)
+Labtest_HINR <- Labtest_HINR %>%
+  mutate(bothHINR_numeric = complete.cases(result_numerical, Result2))
+table(Labtest_HINR$bothHINR_numeric)
+
+# Check that all cases where there are numerical HINR results in Result2 and
+# numerical also meet the condition that they are the same values
+
+Labtest_HINR <- Labtest_HINR %>% 
+  mutate(HINR_both_true = ifelse(HINR_match & bothHINR_numeric, TRUE, FALSE))
+table(Labtest_HINR$HINR_both_true)
+
+#Success! The 104390 HINR values entered into both result and result_numerical 
+#are the same
+
+#Can safely merge result2 (numerical form of result) and result_numerical 
+#columns to generate merged HINR list
+Labtest_HINR$HINR_merged <- coalesce(Labtest_HINR$Result2, Labtest_HINR$result_numerical)
+length(Labtest_HINR$HINR_merged)
+sum(is.na(Labtest_HINR$HINR_merged))
+
+##### Reference ranges
+
+# Check and ref ranges which will lose numeric in mutate
+table(Labtest_HINR$lower_reference_value)
+table(Labtest_HINR$lower_reference_value_numerical)
+table(Labtest_HINR$upper_reference_value)
+table(Labtest_HINR$upper_reference_value_numerical)
+
+## Merge upper and lower ref values to make one numeric column for each
+
+# First convert upper reference and lower reference to numerical 
+Labtest_HINR <- Labtest_HINR %>% 
+  mutate(lower_ref_numeric1 = as.numeric(lower_reference_value))
+Labtest_HINR <- Labtest_HINR %>% 
+  mutate(upper_ref_numeric1 = as.numeric(upper_reference_value))
+Labtest_HINR <- Labtest_HINR %>% 
+  mutate(lower_ref_numeric2 = as.numeric(lower_reference_value_numerical))
+Labtest_HINR <- Labtest_HINR %>% 
+  mutate(upper_ref_numeric2 = as.numeric(upper_reference_value_numerical))
+
+# Check ref ranges where ref_numeric1 and ref_numeric2 match
+
+# Lower
+Labtest_HINR <- Labtest_HINR %>% 
+  mutate(Lower_ref_match = lower_ref_numeric1 == lower_ref_numeric2)
+table(Labtest_HINR$Lower_ref_match)
+
+#Upper
+Labtest_HINR <- Labtest_HINR %>% 
+  mutate(Upper_ref_match = upper_ref_numeric1 == upper_ref_numeric2)
+table(Labtest_HINR$Upper_ref_match)
+
+# Number of ref results where ref_numeric1 and ref_numeric2 both contain 
+#numerical values (i.e ignoring NA values)
+
+#Lower
+Labtest_HINR <- Labtest_HINR %>%
+  mutate(both_lowerref_numeric = complete.cases(lower_ref_numeric1, lower_ref_numeric2))
+table(Labtest_HINR$both_lowerref_numeric)
+
+#Upper
+Labtest_HINR <- Labtest_HINR %>%
+  mutate(both_upperref_numeric = complete.cases(upper_ref_numeric1, upper_ref_numeric2))
+table(Labtest_HINR$both_upperref_numeric)
+
+# Check that all cases where numerical ref range results in both ref_numeric1
+# and ref_numeric2 also meet the condition that they are the same values
+
+#Lower
+Labtest_HINR <- Labtest_HINR %>% 
+  mutate(Lowerref_both_true = ifelse(Lower_ref_match & both_lowerref_numeric, TRUE, FALSE))
+table(Labtest_HINR$Lowerref_both_true)
+
+#Upper
+Labtest_HINR <- Labtest_HINR %>% 
+  mutate(Upperref_both_true = ifelse(Upper_ref_match & both_upperref_numeric, TRUE, FALSE))
+table(Labtest_HINR$Upperref_both_true)
+
+#Success! The ref range values entered into both ref range columns are 
+#the same for both lower and upper ref ranges
+
+#Can safely merge ref ranges (numerical form) for lower and upper columns to 
+#generate single merged ref range
+
+#Lower
+Labtest_HINR$Lowerref_merged <- coalesce(Labtest_HINR$lower_ref_numeric1, Labtest_HINR$lower_ref_numeric2)
+length(Labtest_HINR$Lowerref_merged)
+table(Labtest_HINR$Lowerref_merged)
+
+#Upper
+Labtest_HINR$Upperref_merged <- coalesce(Labtest_HINR$upper_ref_numeric1, Labtest_HINR$upper_ref_numeric2)
+length(Labtest_HINR$Upperref_merged)
+table(Labtest_HINR$Upperref_merged)
+
+##### Units
+table(Labtest_HINR$units,useNA = 'always')
+summary(Labtest_HINR$HINR_merged)
+
+# Check mean of each units
+Labtest_HINR %>%
+  group_by(units) %>%
+  summarise(count= sum(!is.na(HINR_merged)), median(HINR_merged,na.rm = T)) -> HINR_units_means # Means are all within expected ranges if units ug/L for all
+
+
+# All forms of units equivalent and can be ignored
+
+##### Spurious results, outliers, and missing data
+
+summary(Labtest_HINR$HINR_merged)
+
+# Consider HINR >50 as erroneous (n=22) and exclude
+sum(Labtest_HINR$HINR_merged >20, na.rm=TRUE)
+Labtest_HINR <- Labtest_HINR %>%
+  mutate(HINR_clinical = if_else(HINR_merged<20, HINR_merged, NA))
+
+# Total missing data = 3238 values 
+sum(is.na(Labtest_HINR$HINR_merged))
+sum(is.na(Labtest_HINR$HINR_clinical))
+
+## Omit na.s from data frame
+HINR_noNA <- Labtest_HINR[!is.na(Labtest_HINR$HINR_clinical), ]
+sum(is.na(HINR_noNA$HINR_clinical))
+HINR_noNA %>% 
+  summary(study_subject_id)
+
+####Final HINR data frame for analysis
+cirrho_hinr_during_study <- HINR_noNA[,c('study_subject_id','test_name_id','Date','HINR_clinical','Lowerref_merged','Upperref_merged', 'HINR_bound')]
+length(unique(cirrho_hinr_during_study$study_subject_id)) # n = 4850
+
+
+### Platelets ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+#### Platelets (PL)
+Labtest_PL <- filter(labtest_cirrho, test_name_id == "PL")
+length(unique(Labtest_PL$study_subject_id))
+
+##### Combine PL results
+
+table(Labtest_PL$result)
+sum(is.na(Labtest_PL$result))
+table(Labtest_PL$result_numerical)
+sum(is.na(Labtest_PL$result_numerical))
+
+# Filter for non-numerical data using grepl
+non_numeric_PL_data <- Labtest_PL$result[!grepl("^[0-9.]+$", Labtest_PL$result)|is.na(Labtest_PL$result)]
+non_numeric_PL_data2 <- Labtest_PL$result_numerical[!grepl("^[0-9.]+$", Labtest_PL$result_numerical)|is.na(Labtest_PL$result_numerical)]
+
+# Table non-numeric values for result and result2
+table(non_numeric_PL_data)
+table(non_numeric_PL_data2)
+
+# NB No. (1) of "result" contained < which need to be flagged as may bias descriptive stats
+count <- sum(grepl("[<>]", Labtest_PL$result))
+count
+Labtest_PL_bound <- Labtest_HINR[grepl("[<>]", Labtest_HINR$result), ]
+
+# All bounds commit result to group (<2 n=1)
+# Where result value contains bound (n=1, noc 2024) make new variable to flag PL_bound
+Labtest_PL$PL_bound <- if_else(grepl("[<>]", Labtest_PL$result), T, F, F)
+
+# And remove bound (>|<) to allow conversion to numerical
+Labtest_PL$result <- gsub("<|>", "", Labtest_PL$result)
+count <- sum(grepl("[<>]", Labtest_PL$result))
+count
+
+# Remove all non-numeric characters from result to leave only numbers or .
+Labtest_PL$result <- gsub("[^0-9.]", "", Labtest_PL$result)
+table(Labtest_PL$result)
+
+# Re-check non-numeric contents of 'result'
+non_numeric_PL_data <- Labtest_PL$result[!grepl("^[0-9.]+$", Labtest_PL$result)]
+table(non_numeric_PL_data)
+sum(is.na(Labtest_PL$result))
+
+# Now within 'result' only the blank 'non numerical' entries remain (698988 Nov 2024)
+
+# Check 'numeric' contents of 'result'
+numeric_PL_data <-  Labtest_PL$result[grepl("^[0-9.]+$", Labtest_PL$result)]
+table(numeric_PL_data)
+
+# There are 451 (nov 2024) values of '.' only or '.' either side of number within 'numeric' result
+
+# Therefore total expected NAs when converting 'result' to numeric will be 698988 + 451 = 699439
+698988 + 451
+
+# There are 163676 blank and 5018 NULL obs within 'result_numerical'
+# Therefore total expected NAs when converting 'result_numerical' to numeric will be 163676 + 5018 = 168694
+163676 + 5018
+
+# Convert PL result and result_numerical to numeric
+
+Labtest_PL <- Labtest_PL %>%
+  mutate(Result2 = as.numeric(result))
+table(Labtest_PL$Result2)
+sum(is.na(Labtest_PL$Result2))
+
+sum(is.na(Labtest_PL$result_numerical))
+Labtest_PL <- Labtest_PL %>%
+  mutate(result_numerical = as.numeric(result_numerical))
+sum(is.na(Labtest_PL$result_numerical))
+
+# Now we have 2 numerical columns of results and can find if they are identical 
+# (ignoring NA)
+
+# Number of HB results where Result2 and numerical match
+Labtest_PL <- Labtest_PL %>% 
+  mutate(PL_match = Result2 == result_numerical)
+table(Labtest_PL$PL_match)
+
+# As there are no FALSE values, suggests that wherever both contain numeric value, they are the same. 
+# Therefore removed step performed with HB to convert NAs to FALSE 
+
+# Number of PL results where Result2 and numerical both contain numerical values 
+# (i.e ignoring NA values)
+Labtest_PL <- Labtest_PL %>%
+  mutate(bothPL_numeric = complete.cases(result_numerical, Result2))
+table(Labtest_PL$bothPL_numeric)
+
+# Check that all cases where there are numerical PL results in Result2 and
+# numerical also meet the condition that they are the same values
+
+Labtest_PL <- Labtest_PL %>% 
+  mutate(PL_both_true = ifelse(PL_match & bothPL_numeric, TRUE, FALSE))
+table(Labtest_PL$PL_both_true)
+
+#Success! The 167963  PL values entered into both result and result_numerical 
+#are the same
+
+#Can safely merge result2 (numerical form of result) and result_numerical 
+#columns to generate merged PL list
+Labtest_PL$PL_merged <- coalesce(Labtest_PL$Result2, Labtest_PL$result_numerical)
+length(Labtest_PL$PL_merged)
+sum(is.na(Labtest_PL$PL_merged))
+
+##### Reference ranges
+
+# Check and ref ranges which will lose numeric in mutate
+table(Labtest_PL$lower_reference_value)
+table(Labtest_PL$lower_reference_value_numerical)
+table(Labtest_PL$upper_reference_value)
+table(Labtest_PL$upper_reference_value_numerical)
+
+## Merge upper and lower ref values to make one numeric column for each
+
+# First convert upper reference and lower reference to numerical 
+Labtest_PL <- Labtest_PL %>% 
+  mutate(lower_ref_numeric1 = as.numeric(lower_reference_value))
+Labtest_PL <- Labtest_PL %>% 
+  mutate(upper_ref_numeric1 = as.numeric(upper_reference_value))
+Labtest_PL <- Labtest_PL %>% 
+  mutate(lower_ref_numeric2 = as.numeric(lower_reference_value_numerical))
+Labtest_PL <- Labtest_PL %>% 
+  mutate(upper_ref_numeric2 = as.numeric(upper_reference_value_numerical))
+
+# Check ref ranges where ref_numeric1 and ref_numeric2 match
+
+# Lower
+Labtest_PL <- Labtest_PL %>% 
+  mutate(Lower_ref_match = lower_ref_numeric1 == lower_ref_numeric2)
+table(Labtest_PL$Lower_ref_match)
+
+#Upper
+Labtest_PL <- Labtest_PL %>% 
+  mutate(Upper_ref_match = upper_ref_numeric1 == upper_ref_numeric2)
+table(Labtest_PL$Upper_ref_match)
+
+# Number of ref results where ref_numeric1 and ref_numeric2 both contain 
+#numerical values (i.e ignoring NA values)
+
+#Lower
+Labtest_PL <- Labtest_PL %>%
+  mutate(both_lowerref_numeric = complete.cases(lower_ref_numeric1, lower_ref_numeric2))
+table(Labtest_PL$both_lowerref_numeric)
+
+#Upper
+Labtest_PL <- Labtest_PL %>%
+  mutate(both_upperref_numeric = complete.cases(upper_ref_numeric1, upper_ref_numeric2))
+table(Labtest_PL$both_upperref_numeric)
+
+# Check that all cases where numerical ref range results in both ref_numeric1
+# and ref_numeric2 also meet the condition that they are the same values
+
+#Lower
+Labtest_PL <- Labtest_PL %>% 
+  mutate(Lowerref_both_true = ifelse(Lower_ref_match & both_lowerref_numeric, TRUE, FALSE))
+table(Labtest_PL$Lowerref_both_true)
+
+#Upper
+Labtest_PL <- Labtest_PL %>% 
+  mutate(Upperref_both_true = ifelse(Upper_ref_match & both_upperref_numeric, TRUE, FALSE))
+table(Labtest_PL$Upperref_both_true)
+
+#Success! The 198490 ref range values entered into both ref range columns are 
+#the same for both lower and upper ref ranges
+
+#Can safely merge ref ranges (numerical form) for lower and upper columns to 
+#generate single merged ref range
+
+#Lower
+Labtest_PL$Lowerref_merged <- coalesce(Labtest_PL$lower_ref_numeric1, Labtest_PL$lower_ref_numeric2)
+length(Labtest_PL$Lowerref_merged)
+table(Labtest_PL$Lowerref_merged)
+
+#Upper
+Labtest_PL$Upperref_merged <- coalesce(Labtest_PL$upper_ref_numeric1, Labtest_PL$upper_ref_numeric2)
+length(Labtest_PL$Upperref_merged)
+table(Labtest_PL$Upperref_merged)
+
+##### Units
+table(Labtest_PL$units,useNA = 'always')
+
+# All forms of units equivalent to x10*9/L except ?'10' and blank
+Labtest_PL$units <- gsub('x10^9/L','10*9/L',Labtest_PL$units, ignore.case = T)
+table(Labtest_PL$units)
+sum(is.na(Labtest_PL$units))
+
+# Check mean and median values grouped by units
+Labtest_PL %>%
+  group_by(units) %>%
+  summarise(mean(PL_merged,na.rm = T), median(PL_merged,na.rm=T)) -> Labtest_PL_table # All clinically feasible
+
+
+# Therefore just change all units to x10*9/L
+Labtest_PL$units <- 'x10*9/L'
+
+
+##### Spurious results, outliers, and missing data 
+
+summary(Labtest_PL$PL_merged)
+
+# Consider plt count >3000 as erroneous (n=31) and exclude
+sum(Labtest_PL$PL_merged >3000, na.rm=TRUE)
+Labtest_PL <- Labtest_PL %>%
+  mutate(PL_clinical = if_else(PL_merged<3000, PL_merged, NA))
+
+# Total missing data = 7134 values (7103 na + 31 excluded) 
+sum(is.na(Labtest_PL$PL_merged))
+sum(is.na(Labtest_PL$PL_clinical))
+
+## Omit na.s from data frame
+PL_noNA <- Labtest_PL[!is.na(Labtest_PL$PL_clinical), ]
+sum(is.na(PL_noNA$PL_clinical))
+PL_noNA %>% 
+  summary(study_subject_id)
+
+####Final PL data frame for analysis
+cirrho_pl_during_study <- PL_noNA[,c('study_subject_id','test_name_id','Date','PL_clinical','units','PL_bound')]
+
+
+### Mean cell volume (MCV) ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+#Create new data set with only MCV
+
+cirrho_mcv <- filter(labtest_cirrho, test_name_id == "MCV")
+length(unique(cirrho_mcv$study_subject_id))
+
+# Show missing value counts
+missing_counts <- colSums(is.na(cirrho_mcv))
+print(missing_counts)
+rm(missing_counts)
+
+# Merge result and result numerical
+
+# Check Non-numeric mcv
+non_numeric_cirrho_mcv <- cirrho_mcv %>%
+  filter(!grepl("^[0-9. ]+$", result))
+table(non_numeric_cirrho_mcv$result) # no numeric results with associated text therefore OK to become NAs
+
+non_numeric_cirrho_mcv <- cirrho_mcv %>%
+  filter(!grepl("^[0-9. ]+$", result_numerical))
+table(non_numeric_cirrho_mcv$result_numerical) # no numeric results with associated text therefore OK to become NAs
+
+# Make values numeric
+cirrho_mcv <- cirrho_mcv %>%
+  mutate(result_numerical = as.numeric(result_numerical),
+         result = as.numeric(result))
+
+# Show missing value counts to as expected (Nas introduced by coercion = those with non-numeric content)
+missing_counts <- colSums(is.na(cirrho_mcv))
+print(missing_counts) # result na = 60 803, result_numerical na = 17193 as expected
+rm(missing_counts)
+
+# Explore raw values
+summary(cirrho_mcv)
+hist(cirrho_mcv$result_numerical)
+
+# Remove biologically implausible values 
+cirrho_mcv <- cirrho_mcv %>%
+  filter(result >= 50 & result <= 150 | result_numerical >= 50 & result_numerical <=150)
+
+# Explore biologically plausible values
+summary(cirrho_mcv)
+hist(cirrho_mcv$result_numerical)
+hist(cirrho_mcv$result) # normally distributed
+
+# Merge 
+
+cirrho_mcv <- cirrho_mcv %>%
+  mutate(
+    result_final = case_when(
+      is.na(result_numerical) ~ result,  # Use result when result_numerical is missing
+      is.na(result) ~ result_numerical,  # Use result_numerical when result is missing
+      result == result_numerical ~ result,  # Use either if they are the same
+      TRUE ~ NA_real_  # Placeholder for mismatched cases (numeric NA)
+    ),
+    mismatch_flag = ifelse(!is.na(result) & !is.na(result_numerical) & result != result_numerical, 1, 0)
+  )
+table(cirrho_mcv$mismatch_flag) # no mismatches
+sum(is.na(cirrho_mcv$result_final))
+
+cirrho_mcv_during_study <- cirrho_mcv
+
+# Remove unecessary d.fs
+rm(HINR_noNA, HINR_units_means, Labtest_CFER, Labtest_HINR, Labtest_HINR_bound, Labtest_PL, Labtest_PL_bound, Labtest_PL_table, PL_noNA)
+
+### C reactive protein (CRP) ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+#Create new data set with only CRP
+
+cirrho_crp <- filter(labtest_cirrho, test_name_id == "CRP")
+length(unique(cirrho_crp$study_subject_id))
+
+# Show missing value counts
+missing_counts <- colSums(is.na(cirrho_crp))
+print(missing_counts)
+rm(missing_counts)
+
+# Merge result and result numerical
+
+# Check Non-numeric crp
+non_numeric_cirrho_crp <- cirrho_crp %>%
+  filter(!grepl("^[0-9. ]+$", result))
+table(non_numeric_cirrho_crp$result) # no numeric results with associated text therefore OK to become NAs
+
+non_numeric_cirrho_crp <- cirrho_crp %>%
+  filter(!grepl("^[0-9. ]+$", result_numerical))
+table(non_numeric_cirrho_crp$result_numerical) # no numeric results with associated text therefore OK to become NAs
+
+# Make values numeric
+cirrho_crp <- cirrho_crp %>%
+  mutate(result_numerical = as.numeric(result_numerical),
+         result = as.numeric(result))
+
+# Show missing value counts to as expected (Nas introduced by coercion = those with non-numeric content)
+missing_counts <- colSums(is.na(cirrho_crp))
+print(missing_counts) # result na = 52 867, result_numerical na = 5237 as expected
+rm(missing_counts)
+
+# Explore raw values
+summary(cirrho_crp)
+hist(cirrho_crp$result_numerical)
+
+# Explore biologically plausible values
+hist(cirrho_crp$result) # normally distributed
+
+# Merge 
+
+cirrho_crp <- cirrho_crp %>%
+  mutate(
+    result_final = case_when(
+      is.na(result_numerical) ~ result,  # Use result when result_numerical is missing
+      is.na(result) ~ result_numerical,  # Use result_numerical when result is missing
+      result == result_numerical ~ result,  # Use either if they are the same
+      TRUE ~ NA_real_  # Placeholder for mismatched cases (numeric NA)
+    ),
+    mismatch_flag = ifelse(!is.na(result) & !is.na(result_numerical) & result != result_numerical, 1, 0)
+  )
+table(cirrho_crp$mismatch_flag) # no mismatches
+sum(is.na(cirrho_crp$result_final))
+
+# Remove biologically implausible values 
+cirrho_crp <- cirrho_crp %>%
+  filter(result_final <= 700) #n = 1
+
+cirrho_crp_during_study <- cirrho_crp
+
+
+
+### Serum creatinine (creat) ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+#Create new data set with only creat
+
+cirrho_creat <- filter(labtest_cirrho, test_name_id == "BCRE")
+length(unique(cirrho_creat$study_subject_id))
+
+# Show missing value counts
+missing_counts <- colSums(is.na(cirrho_creat))
+print(missing_counts)
+rm(missing_counts)
+
+# Merge result and result numerical
+
+# Check Non-numeric creat
+non_numeric_cirrho_creat <- cirrho_creat %>%
+  filter(!grepl("^[0-9. ]+$", result))
+table(non_numeric_cirrho_creat$result) # no numeric results with associated text therefore OK to become NAs
+
+non_numeric_cirrho_creat <- cirrho_creat %>%
+  filter(!grepl("^[0-9. ]+$", result_numerical))
+table(non_numeric_cirrho_creat$result_numerical) # no numeric results with associated text therefore OK to become NAs
+
+# Make values numeric
+cirrho_creat <- cirrho_creat %>%
+  mutate(result_numerical = as.numeric(result_numerical),
+         result = as.numeric(result))
+
+# Show missing value counts to as expected (Nas introduced by coercion = those with non-numeric content)
+missing_counts <- colSums(is.na(cirrho_creat))
+print(missing_counts) # result na = 59 301, result_numerical na = 16876 as expected
+rm(missing_counts)
+
+# Explore raw values
+summary(cirrho_creat)
+hist(cirrho_creat$result_numerical)
+hist(cirrho_creat$result)
+
+# No biologically implausible values 
+
+# Check units
+table(cirrho_creat$units) # all umol/L except 14 mmol/L (1mmol/L = 1000 umol/L)
+cirrho_creat %>%
+  filter(units == 'mmol/L') 
+
+# Results recorded as mmol/L dont make sense to convert and no reference ranges
+# Therefore exclude 
+
+cirrho_creat <- cirrho_creat %>%
+  filter(units != 'mmol/L') # lose 14 results
+
+# Merge 
+
+cirrho_creat <- cirrho_creat %>%
+  mutate(
+    result_final = case_when(
+      is.na(result_numerical) ~ result,  # Use result when result_numerical is missing
+      is.na(result) ~ result_numerical,  # Use result_numerical when result is missing
+      result == result_numerical ~ result,  # Use either if they are the same
+      TRUE ~ NA_real_  # Placeholder for mismatched cases (numeric NA)
+    ),
+    mismatch_flag = ifelse(!is.na(result) & !is.na(result_numerical) & result != result_numerical, 1, 0)
+  )
+table(cirrho_creat$mismatch_flag) # no mismatches
+sum(is.na(cirrho_creat$result_final))
+
+cirrho_creat_during_study <- cirrho_creat
+
+rm(cirrho_creat)
+
+
+### Bilirubin (bili) ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+#Create new data set with only bili
+
+cirrho_bili <- filter(labtest_cirrho, test_name_id == "XBIL")
+length(unique(cirrho_bili$study_subject_id))
+
+# Show missing value counts
+missing_counts <- colSums(is.na(cirrho_bili))
+print(missing_counts)
+rm(missing_counts)
+
+# Merge result and result numerical
+
+# Check Non-numeric bili
+non_numeric_cirrho_bili <- cirrho_bili %>%
+  filter(!grepl("^[0-9. ]+$", result))
+table(non_numeric_cirrho_bili$result) # no numeric results with associated text therefore OK to become NAs
+
+non_numeric_cirrho_bili <- cirrho_bili %>%
+  filter(!grepl("^[0-9. ]+$", result_numerical))
+table(non_numeric_cirrho_bili$result_numerical) # no numeric results with associated text therefore OK to become NAs
+
+# Make values numeric
+cirrho_bili <- cirrho_bili %>%
+  mutate(result_numerical = as.numeric(result_numerical),
+         result = as.numeric(result))
+
+# Show missing value counts to as expected (Nas introduced by coercion = those with non-numeric content)
+missing_counts <- colSums(is.na(cirrho_bili))
+print(missing_counts) # result na = 54 594, result_numerical na = 11 292 as expected
+rm(missing_counts)
+
+# Explore raw values
+summary(cirrho_bili)
+hist(cirrho_bili$result_numerical)
+hist(cirrho_bili$result) 
+
+# No biologically implausible values 
+
+# Merge 
+
+cirrho_bili <- cirrho_bili %>%
+  mutate(
+    result_final = case_when(
+      is.na(result_numerical) ~ result,  # Use result when result_numerical is missing
+      is.na(result) ~ result_numerical,  # Use result_numerical when result is missing
+      result == result_numerical ~ result,  # Use either if they are the same
+      TRUE ~ NA_real_  # Placeholder for mismatched cases (numeric NA)
+    ),
+    mismatch_flag = ifelse(!is.na(result) & !is.na(result_numerical) & result != result_numerical, 1, 0)
+  )
+table(cirrho_bili$mismatch_flag) # no mismatches
+sum(is.na(cirrho_bili$result_final))
+
+# Remove biologically implausible values 
+cirrho_bili <- cirrho_bili %>%
+  filter(result_final <= 1200) #n = 1
+
+cirrho_bili_during_study <- cirrho_bili
+rm(cirrho_bili)
+
+### Mean Cell Hb (MCH) ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+#Create new data set with only mch
+
+table(Labtest.data$test_name_id)
+cirrho_mch <- filter(labtest_cirrho, test_name_id == "MC")
+length(unique(cirrho_mch$study_subject_id))
+
+# Merge result and result numerical
+
+# Check Non-numeric mch
+non_numeric_cirrho_mch <- cirrho_mch %>%
+  filter(!grepl("^[0-9. ]+$", result))
+table(non_numeric_cirrho_mch$result) # # >40.0 n = 3 >400 n= 2 
+
+non_numeric_cirrho_mch <- cirrho_mch %>%
+  filter(!grepl("^[0-9. ]+$", result_numerical))
+table(non_numeric_cirrho_mch$result_numerical) # no numeric results with associated text therefore OK to become NAs
+
+# Remove bound (>|<) from result to allow conversion to numerical
+cirrho_mch$result <- gsub("<|>", "", cirrho_mch$result)
+count <- sum(grepl("[<>]", cirrho_mch$result))
+rm(count)
+
+# Make values numeric
+cirrho_mch <- cirrho_mch %>%
+  mutate(result_numerical = as.numeric(result_numerical),
+         result = as.numeric(result))
+
+# Show missing value counts to as expected (Nas introduced by coercion = those with non-numeric content)
+missing_counts <- colSums(is.na(cirrho_mch))
+print(missing_counts) # result na = 60,633, result_numerical na = 17,026 as expected
+rm(missing_counts)
+
+# Explore raw values
+summary(cirrho_mch)
+hist(cirrho_mch$result_numerical)
+hist(cirrho_mch$result) 
+
+# Merge 
+cirrho_mch <- cirrho_mch %>%
+  mutate(
+    result_final = case_when(
+      is.na(result_numerical) ~ result,  # Use result when result_numerical is missing
+      is.na(result) ~ result_numerical,  # Use result_numerical when result is missing
+      result == result_numerical ~ result,  # Use either if they are the same
+      TRUE ~ NA_real_  # Placeholder for mismatched cases (numeric NA)
+    ),
+    mismatch_flag = ifelse(!is.na(result) & !is.na(result_numerical) & result != result_numerical, 1, 0)
+  )
+table(cirrho_mch$mismatch_flag) # no mismatches
+sum(is.na(cirrho_mch$result_final))
+
+# Explore raw values
+summary(cirrho_mch)
+hist(cirrho_mch$result_final)
+cirrho_mch %>%
+  filter(result_final >= 500| result_final <= 10) #n = 4 and n= 10
+
+# Biologically implausible > 500 (or NA)
+cirrho_mch <- cirrho_mch %>%
+  filter(result_final < 500 & result_final > 10  )
+
+hist(cirrho_mch$result_final)
+
+# two clearly distinct populations - one is * 10 expected values
+
+# Check units
+table(cirrho_mch$units)
+cirrho_mch %>%
+  filter(units == '/cu.mm') # n = 12 NB to convert cubic mm to 10^9/L divide by 100 but values don't make sense
+
+# Distribution of each
+ggplot(cirrho_mch, aes(x = result_final)) +
+  geom_histogram(binwidth = 2, fill = "skyblue", color = "black", alpha = 0.7) +
+  facet_wrap(~ units, scales = "free_y") +  # Creates separate histograms by 'units'
+  labs(title = "Histograms of result_final by Units", x = "Result Final", y = "Frequency") +
+  theme_minimal()
+
+# results > 100 are in g/L or NULL and are all *10 expected values
+cirrho_mch %>% 
+  filter(result_final>=100) #n = 72,779
+
+# divide by 10 if result is >100
+cirrho_mch <- cirrho_mch %>%
+  mutate(result_final = if_else(result_final >= 100, result_final / 10, result_final))
+
+# Distribution of each
+ggplot(cirrho_mch, aes(x = result_final)) +
+  geom_histogram(binwidth = 2, fill = "skyblue", color = "black", alpha = 0.7) +
+  facet_wrap(~ units, scales = "free_y") +  # Creates separate histograms by 'units'
+  labs(title = "Histograms of result_final by Units", x = "Result Final", y = "Frequency") +
+  theme_minimal()
+
+# Overall data
+summary(cirrho_mch)
+
+# All within biologically plausible range equivalent to pg
+
+cirrho_mch_during_study <- cirrho_mch
+rm(cirrho_mch)
+
+
+### White blood cells (WB) ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+#Create new data set with only wbc
+
+cirrho_wbc <- filter(labtest_cirrho, test_name_id == "WB")
+length(unique(cirrho_wbc$study_subject_id))
+
+# Merge result and result numerical
+
+# Check Non-numeric wbc
+non_numeric_cirrho_wbc <- cirrho_wbc %>%
+  filter(!grepl("^[0-9. ]+$", result))
+table(non_numeric_cirrho_wbc$result) # # no relevant numeric results with associated text therefore OK to become NAs
+
+non_numeric_cirrho_wbc <- cirrho_wbc %>%
+  filter(!grepl("^[0-9. ]+$", result_numerical))
+table(non_numeric_cirrho_wbc$result_numerical) # no numeric results with associated text therefore OK to become NAs
+
+# Make values numeric
+cirrho_wbc <- cirrho_wbc %>%
+  mutate(result_numerical = as.numeric(result_numerical),
+         result = as.numeric(result))
+
+# Show missing value counts to as expected (Nas introduced by coercion = those with non-numeric content)
+missing_counts <- colSums(is.na(cirrho_wbc))
+print(missing_counts) # result na = 10,490, result_numerical na = 18 195 as expected
+rm(missing_counts)
+
+
+# Explore raw values
+summary(cirrho_wbc)
+hist(cirrho_wbc$result_numerical)
+hist(cirrho_wbc$result) 
+
+
+# Merge 
+
+cirrho_wbc <- cirrho_wbc %>%
+  mutate(
+    result_final = case_when(
+      is.na(result_numerical) ~ result,  # Use result when result_numerical is missing
+      is.na(result) ~ result_numerical,  # Use result_numerical when result is missing
+      result == result_numerical ~ result,  # Use either if they are the same
+      TRUE ~ NA_real_  # Placeholder for mismatched cases (numeric NA)
+    ),
+    mismatch_flag = ifelse(!is.na(result) & !is.na(result_numerical) & result != result_numerical, 1, 0)
+  )
+table(cirrho_wbc$mismatch_flag) # no mismatches
+sum(is.na(cirrho_wbc$result_final))
+
+# Explore raw values
+summary(cirrho_wbc)
+hist(cirrho_wbc$result_final)
+cirrho_wbc %>%
+  filter(result_final > 1000| is.na(result_final)) #n = 1672
+
+# Biologically implausible > 1,000 or NA
+cirrho_wbc <- cirrho_wbc %>%
+  filter(result_final <= 1000 )
+
+hist(cirrho_wbc$result_final)
+
+# Check units
+table(cirrho_wbc$units)
+cirrho_wbc %>%
+  filter(units == '/cu.mm') # n = 12 NB to convert cubic mm to 10^9/L divide by 100 but values don't make sense
+
+# Remove values in cu/mm
+cirrho_wbc <- cirrho_wbc %>%
+  filter(!grepl("/cu.mm", units))
+
+hist(cirrho_wbc$result_final)
+cirrho_50 <- cirrho_wbc %>%
+  filter(result_final == 50 & grepl('RYJ', study_subject_id )) # n= 2,479 observation where WCC = 50 from same site with no other info
+rm(cirrho_50)
+
+# Remove erroneous entries of '50' where site is RYJ
+cirrho_wbc <- cirrho_wbc %>%
+  filter(!(result_final == 50 & grepl('RYJ', study_subject_id )))
+
+hist(cirrho_wbc$result_final)
+
+# Same with 100
+cirrho_wbc_100 <- cirrho_wbc %>%
+  filter(result_final ==100 & grepl('RYJ', study_subject_id ))
+rm(cirrho_wbc_100)
+
+# Remove erroneous entries of '100' where site is RYJ
+cirrho_wbc <- cirrho_wbc %>%
+  filter(!(result_final == 100 & grepl('RYJ', study_subject_id )))
+
+hist(cirrho_wbc$result_final)
+
+# create cleaned df
+cirrho_wbc_during_study <- cirrho_wbc
+rm(cirrho_wbc)
+
+
+### Neutrophils (NEUB) ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+#Create new data set with only neut
+
+cirrho_neut <- filter(labtest_cirrho, test_name_id == "NEUB")
+length(unique(cirrho_neut$study_subject_id))
+
+# Show missing value counts
+missing_counts <- colSums(is.na(cirrho_neut))
+print(missing_counts)
+rm(missing_counts)
+
+# Merge result and result numerical
+
+# Check Non-numeric neut
+non_numeric_cirrho_neut <- cirrho_neut %>%
+  filter(!grepl("^[0-9. ]+$", result))
+table(non_numeric_cirrho_neut$result) # some with % prior to count
+
+neut_percent <- cirrho_neut %>%
+  filter(grepl("%", result ))
+
+# Remove all values prior to %, keep remaining
+cirrho_neut$result <- sub(".*%\\s*", "", cirrho_neut$result)
+neut_percent <- cirrho_neut %>%
+  filter(grepl("%", result )) # n = 30, units are appropriate (x109)
+
+# Check non-numeric within result_numerical
+non_numeric_cirrho_neut <- cirrho_neut %>%
+  filter(!grepl("^[0-9. ]+$", result_numerical))
+table(non_numeric_cirrho_neut$result_numerical) # no numeric results with associated text therefore OK to become NAs
+
+# Make values numeric
+cirrho_neut <- cirrho_neut %>%
+  mutate(result_numerical = as.numeric(result_numerical),
+         result = as.numeric(result))
+
+# Show missing value counts to as expected (Nas introduced by coercion = those with non-numeric content)
+missing_counts <- colSums(is.na(cirrho_neut))
+print(missing_counts) # result na = 58 910, result_numerical na = 17 146 as expected
+rm(missing_counts)
+
+
+# Explore raw values
+summary(cirrho_neut)
+hist(cirrho_neut$result_numerical)
+hist(cirrho_neut$result) 
+
+
+# Merge 
+
+cirrho_neut <- cirrho_neut %>%
+  mutate(
+    result_final = case_when(
+      is.na(result_numerical) ~ result,  # Use result when result_numerical is missing
+      is.na(result) ~ result_numerical,  # Use result_numerical when result is missing
+      result == result_numerical ~ result,  # Use either if they are the same
+      TRUE ~ NA_real_  # Placeholder for mismatched cases (numeric NA)
+    ),
+    mismatch_flag = ifelse(!is.na(result) & !is.na(result_numerical) & result != result_numerical, 1, 0)
+  )
+table(cirrho_neut$mismatch_flag) # no mismatches
+sum(is.na(cirrho_neut$result_final))
+
+# Explore raw values
+summary(cirrho_neut)
+hist(cirrho_neut$result_final)
+cirrho_neut %>%
+  filter(result_final > 1000 | is.na(result_final)) #n = 695
+
+# Biologically implausible > 1,000 or NA
+cirrho_neut <- cirrho_neut %>%
+  filter(result_final <= 1000 )
+
+hist(cirrho_neut$result_final)
+
+# Check units
+table(cirrho_neut$units)
+cirrho_neut %>%
+  filter(units == '%') # Need to exclude as % values, cannot infer absolute counts
+
+# Remove values in %
+cirrho_neut <- cirrho_neut %>%
+  filter(!grepl("%", units))
+
+cirrho_neut_during_study <- cirrho_neut
+rm(cirrho_neut)
+
+hist(cirrho_neut_during_study$result_final)
+
+### GENERATE DATA FRAME WITH INCLUSION/END OF FU FOR ADULT CIRRHOSIS PT WITHIN STUDY WINDOW   ---------------------------------------------------------
+
+
+# Add inclusion date (latest of diagnosis cirrhosis or >18 years)
+
+cirrho_cohort_incl <- cirrho_cohort %>%
+  left_join(Demographics.data %>% select(study_subject_id, year_of_birth),
+            by = 'study_subject_id') %>%
+  mutate(cutoff_birth = make_date(year_of_birth, 12, 31),
+         inclusion_date = pmax(date_diagnosis, cutoff_date_18),
+         age_at_inclusion = floor(time_length(interval(cutoff_birth, inclusion_date), "years"))) %>%
+  select(-c(cutoff_birth, year_of_birth))
+
+# Add end of follow up date (earliest of death, liver transplant, last data extract)
+cirrho_cohort_incl_endoffu <- cirrho_cohort_incl %>%
+  left_join(death.data %>%  select(study_subject_id, year_of_death),
+            by = 'study_subject_id') %>%
+  mutate(cutoff_death = make_date(year_of_death, 12, 31),
+         end_of_fu = pmin(
+           if_else(date_transplant >= date_diagnosis, date_transplant, as.Date(NA), missing = as.Date(NA)),
+           extract_date, cutoff_death, na.rm = TRUE
+         )
+  ) 
+
+
+# Final cirrho cohort with inclusion (latest of cirrhosis diagnosis and age >18 years) and end of fu date (earliest of liver transplant, death or last data extract)
+cirrho_cohort_final <- cirrho_cohort_incl_endoffu %>%
+  select(c(study_subject_id, inclusion_date, end_of_fu))
+
+
+# # Name: S Maynard
+# Project: Liver HIC Project i 
+# Version Number: V2.0
+# Date: 2025/04/08
+# File type - .R
+# ---------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+# Data Source - Project i First part Project_i_IDA_ML: cirrho_cohort_final 
+
+# CIRRHO COHORT FINAL = ALL ADULT PATIENTS WITH CIRRHOSIS DIAGNOSIS AT ANY TIME WITH INCL and END OF FU DATE
+
+# ---------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+### GENERATE DESCRIPTIVE DATA FRAME WITH VARIABLES (ferritin, Hb, CRP) FOR ADULT CIRRHOSIS PT RELEVANT TO FERRITIN WITHIN STUDY WINDOW   ---------------------------------------------------------
+
+# STEP 1: Filter variables 
+
+#rm(cirrho_hb_desc)
+#rm(cirrho_crp_desc)
+#rm(cirrho_cfer_desc)
+
+# Hb results
+# Convert both data frames to data.tables
+setDT(cirrho_hb_during_study)
+setDT(cirrho_cohort_final)
+
+# Perform efficient join and filtering for Hb results within study window
+cirrho_hb_desc <- cirrho_hb_during_study[cirrho_cohort_final, on = "study_subject_id"][Date >= (inclusion_date - 90) & Date <= end_of_fu] 
+
+
+# CFER results
+# Convert both data frames to data.tables
+setDT(cirrho_cfer_during_study)
+setDT(cirrho_cohort_final)
+
+# Perform efficient join and filtering for Hb results within study window
+cirrho_cfer_desc <- cirrho_cfer_during_study[cirrho_cohort_final, on = "study_subject_id"][Date >= (inclusion_date - 90) & Date <= end_of_fu] 
+
+
+# CRP results
+# Convert both data frames to data.tables
+setDT(cirrho_crp_during_study)
+setDT(cirrho_cohort_final)
+
+# Perform efficient join and filtering for Hb results within study window
+cirrho_crp_desc <- cirrho_crp_during_study[cirrho_cohort_final, on = "study_subject_id"][Date >= (inclusion_date - 90) & Date <= end_of_fu] 
+
+#--------------------------------------
+
+# Step 2: add to d.f
+
+#rm(cirrho_desc)
+
+## Add age at inclusion
+cirrho_desc <- cirrho_cohort_final %>%
+  left_join(cirrho_cohort_incl %>% select(study_subject_id, age_at_inclusion), by = 'study_subject_id')
+
+hist(cirrho_desc$age_at_inclusion) # normally distributed
+
+## Add gender
+cirrho_desc <- cirrho_desc %>%
+  left_join(cirrho_demographics %>% select(study_subject_id, gender_id_uncoded), by = 'study_subject_id')
+
+## Add ethnicity
+cirrho_desc <- cirrho_desc %>%
+  left_join(cirrho_demographics %>% select(study_subject_id,ethnic_group), by ="study_subject_id")
+
+#### Add nadir hb results
+
+cirrho_desc <- cirrho_desc %>%
+  left_join(cirrho_hb_desc %>% dplyr::select(study_subject_id, hb_value, Date), by = 'study_subject_id') %>%
+  group_by(study_subject_id) %>%
+  arrange(hb_value) %>%
+  dplyr::slice(1) %>%
+  dplyr::rename(hb_min = hb_value,
+                hb_date = Date) %>%
+  ungroup()
+
+
+## Add anaemia groups based on Hb thresholds, age (all >18), and gender
+cirrho_desc <- cirrho_desc %>%
+  mutate(
+    anaemia = case_when(
+      is.na(hb_min) ~ "No Hb",                 # For missing ferritin 
+      # Men
+      gender_id_uncoded == "Male" & hb_min >= 110 & hb_min < 130 ~ "Mild",
+      gender_id_uncoded == "Male" & hb_min >= 80 & hb_min < 110 ~ "Moderate",
+      gender_id_uncoded == "Male" & hb_min < 80 ~ "Severe",
+      
+      # Women
+      gender_id_uncoded == "Female" & hb_min >= 110 & hb_min < 120 ~ "Mild",
+      gender_id_uncoded == "Female" & hb_min >= 80 & hb_min < 110 ~ "Moderate",
+      gender_id_uncoded == "Female" & hb_min < 80 ~ "Severe",
+      
+      # Default to "No Anaemia" if Hb doesn't meet any criteria
+      TRUE ~ "No Anaemia"
+    )
+  )
+table(cirrho_desc$anaemia) # no hb n = 256
+
+
+## add nadir ferritin results
+cirrho_desc <- cirrho_desc %>%
+  left_join(cirrho_cfer_desc %>% dplyr::select(study_subject_id, CFER_merged, Date), by = 'study_subject_id') %>%
+  group_by(study_subject_id) %>%
+  arrange(CFER_merged) %>%
+  dplyr::slice(1) %>%
+  dplyr::rename(cfer_min = CFER_merged,
+                cfer_date = Date) %>%
+  ungroup()
+
+##add column ferritin yes or no
+cirrho_desc <- cirrho_desc %>%
+  mutate(ferritin_yn = if_else(!is.na(cfer_min),1,0))
+
+
+## Classify ferritin 
+cirrho_desc <- cirrho_desc %>%
+  mutate(
+    ferritin_group = case_when(
+      is.na(cfer_min) ~ "No ferritin",                 # For missing ferritin 
+      cfer_min < 30 ~ "<30",               
+      cfer_min >= 30 & cfer_min < 50 ~ "<50",        
+      cfer_min >= 50 & cfer_min <100 ~ "<100",
+      TRUE ~ ">=100"                            
+    )
+  )
+table(cirrho_desc$ferritin_group) # ferritin <30 n = 817, no ferritin n = 1799
+
+# remove date cols
+cirrho_desc<- cirrho_desc %>%
+  select(-c(hb_date, cfer_date))
+
+
+## Add length of follow up
+cirrho_desc <- cirrho_desc %>%
+  mutate(length_fu_years = round(time_length(interval(inclusion_date, end_of_fu), "years"),1))
+
+hist(cirrho_desc$length_fu_years) # non-normal
+
+
+## Add number of tests per patient
+# Count tests per patient in each results table
+hb_counts <- cirrho_hb_desc %>%
+  count(study_subject_id, name = "hb_tests")
+
+cfer_counts <- cirrho_cfer_desc %>%
+  count(study_subject_id, name = "cfer_tests")  # prefer underscore in names
+
+# Join into your patient-level table and replace NAs with 0
+cirrho_desc <- cirrho_desc %>%
+  left_join(hb_counts,   by = "study_subject_id") %>%
+  left_join(cfer_counts, by = "study_subject_id") %>%
+  mutate(
+    hb_tests   = coalesce(hb_tests,   0L),
+    cfer_tests = coalesce(cfer_tests, 0L)
+  )
+
+hist(cirrho_desc$hb_tests) # non-normal
+hist(cirrho_desc$cfer_tests) # non-normal
+
+# total tests
+
+summary_table <- cirrho_desc %>%
+  summarise(
+    across(
+      c(hb_tests, cfer_tests),
+      list(
+        total  = ~ sum(., na.rm = TRUE),
+        q1     = ~ quantile(., 0.25, na.rm = TRUE),
+        median = ~ median(., na.rm = TRUE),
+        q3     = ~ quantile(., 0.75, na.rm = TRUE)
+      ),
+      .names = "{.col}_{.fn}"
+    )) 
+
+# ---------------------------------------------------------------------------------------------------------------------------------------------------------------------
+# DESC TABLE 1 SPLIT BY FERRITIN TEST Y/N
+
+# Order factor levels
+cirrho_desc$anaemia <- factor(cirrho_desc$anaemia, levels = c("No Anaemia","Mild","Moderate","Severe","No Hb"))
+cirrho_desc$ferritin_group <- factor(cirrho_desc$ferritin_group, levels = c("<30","<50","<100",">=100","No ferritin"))
+cirrho_desc$ethnic_group <- factor(cirrho_desc$ethnic_group, levels = c("White","Asian","Black","Mixed","Other","Not stated"))
+
+
+desc_table_one <- CreateTableOne(vars = c("age_at_inclusion","gender_id_uncoded","ethnic_group", "anaemia", "ferritin_group","length_fu_years"), 
+                                 strata = "ferritin_yn",
+                                 includeNA = T, 
+                                 data = cirrho_desc,
+                                 test = F,
+                                 addOverall = T)
+
+
+print(desc_table_one,
+      nonnormal = "length_fu_years")
+
+# Convert TableOne to a data frame (or matrix)
+desc_table_one_df <- as.data.frame(print(desc_table_one,nonnormal = "length_fu_years", quote = FALSE, noSpaces = TRUE))
+
+# Export the data frame to CSV
+write.csv(desc_table_one_df, "desc_table_one.csv", row.names = T)
+
+# ---------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+# BURDEN OF IDA
+# No. pt who had ferritin and Hb within 90d prior to 14d post during study period
+
+# Rename date cols to allow identification after join
+# dplyr::rename columns
+cirrho_cfer_desc <- cirrho_cfer_desc %>%
+  select(-test_name_id) %>%
+  dplyr::rename(cfer_date = Date,
+                cfer_value = CFER_merged,
+                cfer_units = units)
+
+cirrho_hb_desc <- cirrho_hb_desc %>%
+  select(-test_name_id) %>%
+  dplyr::rename(hb_date = Date,
+                hb_units = units)
+
+## JOIN HB AND FERRITIN
+# Add hb_value from within study window (inclusion - 90 to endoffu) to ferritin data based on matching study_subject_id and date 90 days prior or 14 days after (inclusive)
+# RATIONALE: Beyond 14 days after may be treated with iron and 'baseline' HB/MCV/MCH etc values not representative of iron deficiency
+
+# If date 2 (hb_date) is BEFORE date 1 (cfer_date) date_diff will be POSITIVE
+# If date 2 (hb_date) is AFTER date 1 (cfer_date)) date_diff will be negative
+
+
+#rm(cirrho_cfer_hb_desc)
+cirrho_cfer_hb_desc <- cirrho_cfer_desc %>%
+  left_join(cirrho_hb_desc %>% select(-c(inclusion_date, end_of_fu)), by = "study_subject_id", relationship = "many-to-many") %>%
+  filter(difftime(cfer_date, hb_date, units = "days") <= 90 & difftime(cfer_date, hb_date, units = "days") >= 0) %>% # NB only 3 additional patients captured if extend to Hb up to 90d post ferritin
+  mutate(cfer_hb_diffdays = difftime(cfer_date, hb_date, units = "days"))
+
+
+# Label yn IDA diagnosis per patient at different cutoffs
+
+# Binary outcome for every ferritin Hb pair within 90d : 1 if ferritin <30, 0 if not
+# Of all with ferritin <30, binary outcome for closest Hb: 1 if Hb also anaemic, 0 if not
+
+# Per patient, take closest Hb to each ferritin
+# Where IDA criteria met, keep Hb-ferritin pair
+# Where no IDA take closest Hb-ferritin pair
+
+# Join gender for anaemia diagnosis 
+cirrho_cfer_hb_desc <- cirrho_cfer_hb_desc %>%
+  left_join(cirrho_demographics %>% select (study_subject_id, gender_id_uncoded), by = 'study_subject_id')
+
+
+# For ferritin <30
+cirrho_cfer_hb_closest <- cirrho_cfer_hb_desc %>%
+  # Step 1: Create row-level binary outcome for fer level and IDA yn
+  mutate(
+    ida_30yn = if_else(
+      (cfer_value < 30 & hb_value <= 120 & gender_id_uncoded == "Female") |
+        (cfer_value < 30 & hb_value <= 130 & gender_id_uncoded == "Male"), 1, 0, missing = 0),
+    ida_50yn = if_else(
+      (cfer_value < 50 & hb_value <= 120 & gender_id_uncoded == "Female") |
+        (cfer_value < 50 & hb_value <= 130 & gender_id_uncoded == "Male"), 1, 0, missing = 0),
+    ida_100yn = if_else(
+      (cfer_value < 100 & hb_value <= 120 & gender_id_uncoded == "Female") |
+        (cfer_value < 100 & hb_value <= 130 & gender_id_uncoded == "Male"), 1, 0, missing = 0)
+  ) %>%
+  # Step 3: Select smallest diff days per patient per ferritin
+  group_by(study_subject_id, cfer_date) %>% # results return one row per ferritin date for each patient
+  arrange(abs(cfer_hb_diffdays), desc(cfer_hb_diffdays)) %>%  # Prioritise smallest diffdays, prefer positive on ties
+  dplyr::slice(1) %>%
+  ungroup() 
+
+
+set.seed(123)  # for reproducible random tie-breaks
+
+cirrho_desc_ida_yn <- cirrho_cfer_hb_closest %>%
+  mutate(.priority = if_else(ida_30yn == 1L, 0L, 1L)) %>%                 # prefer ida_30yn==1
+  arrange(study_subject_id, .priority, abs(cfer_hb_diffdays), runif(dplyr::n())) %>%
+  distinct(study_subject_id, .keep_all = TRUE) %>%                      # keep first per patient
+  select(-.priority)
+
+
+table(cirrho_desc_ida_yn$ida_30yn) # IDA = 654 no IDA = 2816 (total n = 3470, IDA = 18.8%) NB only lose further 19 patients by removing Hb after, 2 patients by not extending Hb to beyond -90 days
+table(cirrho_desc_ida_yn$ida_50yn) # IDA <50 n = 791
+table(cirrho_desc_ida_yn$ida_100yn) # IDA <100 n = 973
+
+
+## Add variable indicating if Hb 90d prior to 14d post ferritin to cirrho_desc d.f
+cirrho_desc <- cirrho_desc %>%
+  mutate(hb_fer_90 = ifelse(study_subject_id %in% cirrho_cfer_hb_desc$study_subject_id, 1, 0))
+
+table(cirrho_desc$hb_fer_90) # hb_fer_90 n = 3470 as expected
+
+# ---------------------------------------------------------------------------------------------------------------------------------------------------------------------
+# ADDITIONAL CODE 05/03/2026 - DISTRIBUTION SMALLEST DATE DIFF BETWEEN FERRITIN-HB PAIRS
+# ---------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+# scatter of date diff (x) by number of observations (y)
+library(ggplot2)
+
+str(cirrho_desc_ida_yn)
+  
+# Convert difftime to numeric (days)
+cirrho_desc_ida_yn_plot <- cirrho_desc_ida_yn %>% 
+  mutate(cfer_hb_diffdays_num = as.numeric(cfer_hb_diffdays))
+
+# Create frequency table stratified by IDA
+cirrho_desc_ida_yn_plot_data <- cirrho_desc_ida_yn_plot %>%
+  group_by(ida_30yn, cfer_hb_diffdays_num) %>%
+  summarise(frequency = n(), .groups = "drop")
+
+# Scatter plot
+ggplot(cirrho_desc_ida_yn_plot_data,
+       aes(x = cfer_hb_diffdays_num,
+           y = frequency,
+           color = factor(ida_30yn))) +
+  geom_point(size = 3, alpha = 0.7) +
+  labs(
+    x = "cfer_hb_diffdays (days)",
+    y = "Frequency",
+    color = "IDA Status",
+    title = "Frequency of cfer_hb_diffdays by IDA Status"
+  ) +
+  scale_color_manual(values = c("0" = "blue", "1" = "red"),
+                     labels = c("0" = "No IDA", "1" = "IDA")) +
+  theme_minimal()
+# ------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+# GENERATE ML DATA FRAME WITH VARIABLES ANCHORED TO CFER IN STUDY WINDOW
+# NB need to limit other variables to same end of fu date
+# -----------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+# NB CIRRHO_DESC_IDA_YN = ALL ELIGIBLE PATIENTS (DIGANOSIS CIRRHOSIS AND >18Y) WITH FERRITIN WITHIN STUDY PERIOD (90d PRIOR TO ELIGIBILITY TO END OF FU) AND HB WITHIN 90D PRIOR OR 14D POST FERRITIN (but prior to endoffu)
+# is appropriate data frame to filter IDA_ML d.f on
+# total n = 3470, IDA FER 30 = 654  
+
+
+## QUICK CHECKS
+# Unique study ID within filtered CFER to study window
+length(unique(cirrho_cfer_desc$study_subject_id)) # n = 3502
+
+# Explore proportion of patients who have ferritin <30 recorded at any time
+cirrho_cfer_desc %>%
+  group_by(study_subject_id) %>%
+  summarise(low_cfer = any(cfer_value < 30, na.rm = TRUE), .groups = "drop") %>%
+  summarise(
+    n_patients   = n(),
+    n_low_cfer   = sum(low_cfer),
+    pct_with_low = 100 * n_low_cfer / n_patients
+  ) 
+# n = 817 ferritin <30 of n = 3502 with cfer result (23.3%)
+# (With tx - n = 925 ferritin <30 of n = 3641 with cfer result (25.4%))
+
+
+cirrho_cfer_hb_desc %>%
+  summarise(n_distinct(study_subject_id)) # n = 3470 
+# NB only lose 12 patients form where ferritin has no clinically relevant Hb (from total 3502 with cfer result)
+
+
+# Explore proportion with ferritin <30 of all with clinically relevant Hb
+cirrho_cfer_hb_desc %>%
+  group_by(study_subject_id) %>%
+  summarise(low_cfer = any(cfer_value < 30, na.rm = TRUE), .groups = "drop") %>%
+  summarise(
+    n_patients   = n(),
+    n_low_cfer   = sum(low_cfer),
+    pct_with_low = 100 * n_low_cfer / n_patients
+  ) 
+
+# n = 811 ferritin <30 of n = 3470 with cfer-Hb paired result (23.4%)
+# only only 5 patients with ferritin <30 and cirrhosis diagnosis did not have Hb within clinically relevant time frame (<=90d prior or same day))
+# (with tx - n = 923 ferritin <30 of n = 3631 with cfer result (25.4%))
+# (with tx - only 2 patients with ferritin <30 and cirrhosis diagnosis did not have Hb within clinically relevant time frame (<=90d prior or <=14d post))
+
+
+# Use cirrho_desc_ida_yn for yn IDA diagnosis per patient 
+cirrho_desc_ida_yn %>%
+  summarise(n_distinct(study_subject_id))
+table(cirrho_desc_ida_yn$ida_30yn)
+# total n = 3470, ida = 654, no ida = 2816 (therefore 157 have NAID fer <30 (811-654))
+# (with tx - total n = 3631, ida = 778, no ida = 2853 (therefore 145 have NAID fer <30 (923-778)))
+
+# Check diff days overall
+cirrho_desc_ida_yn %>%
+  filter(abs(cfer_hb_diffdays) > 14) # Nov '25 n = 26 patients with IDA who's Hb and ferritin are more than 14 days apart
+
+hist(as.numeric(cirrho_desc_ida_yn$cfer_hb_diffdays, units = "days")) # "Histogram of Days Between Hb and Ferritin results"
+
+# Check diff days between inclusion date and ferritin date
+cirrho_desc_ida_yn <- cirrho_desc_ida_yn %>%
+  mutate(cfer_incl = cfer_date - inclusion_date)
+cirrho_desc_ida_yn %>%
+  filter(cfer_incl <= -45) # n = 275 with remaining look back only 45 days in initial study window
+
+##### CREATE NEW DF CIRRHO_IDA_ML -------------------------------------------------------------------
+
+# cirrho cohort IDA subset
+cirrho_ida_cohort_final <- cirrho_desc_ida_yn %>%
+  select("study_subject_id","inclusion_date","end_of_fu")
+
+# study_subject_id, gender_id_uncoded, year_of_birth, ethnicity, hb_date, hb_value, cfer_date, cfer_value, ida_yn
+cirrho_ida_ml <- cirrho_desc_ida_yn %>%
+  left_join(cirrho_demographics %>% dplyr::select(study_subject_id, year_of_birth, ethnic_group), by = 'study_subject_id') %>%
+  dplyr::select(study_subject_id, gender_id_uncoded, year_of_birth, ethnic_group, hb_date, hb_value, cfer_date, cfer_value, ida_30yn) %>%
+  rename(ida_yn = 'ida_30yn')
+
+
+# Add variables:
+# Age at ferritin
+cirrho_ida_ml <- cirrho_ida_ml %>%
+  mutate(cfer_year = year(cfer_date), #Extract year from cfer date numeric
+         age = cfer_year - year_of_birth) %>%
+  dplyr::select(-c(cfer_year, year_of_birth)) %>%
+  relocate(age, .after =3) %>%
+  dplyr::rename(hb_fer_date = hb_date,
+                hb_fer_value = hb_value)
+
+n_distinct(cirrho_ida_ml$study_subject_id)
+
+# Hb >= 90d prior
+
+# Filter all Hb during study to prior to endoffu
+# Convert both data frames to data.tables
+setDT(cirrho_hb_during_study)
+setDT(cirrho_ida_cohort_final)
+
+# Perform efficient join and filtering for Hb results prior to endoffu
+cirrho_hb_endfu <- cirrho_hb_during_study[cirrho_ida_cohort_final, on = "study_subject_id"][Date <= end_of_fu] %>%
+  rename(hb_date = 'Date')
+
+
+# Join 
+cirrho_ida_ml <- cirrho_ida_ml %>%
+  left_join(cirrho_hb_endfu %>% dplyr::select(study_subject_id, hb_date, hb_value), by = 'study_subject_id') %>%
+  mutate(hb_3m_yn = if_else (
+    difftime(hb_fer_date, hb_date, units = "days") >= 90, 1, 0, missing = 0 )
+  )  %>%
+  # Step 2: Assign patient-level outcome
+  dplyr::group_by(study_subject_id) %>%
+  mutate(number_hb_3m = sum(hb_3m_yn)) %>%  # 1 if any row is 1, else 0
+  ungroup() %>%
+  # Step 3: Keep only relevant rows for filtering
+  filter(hb_3m_yn >= 1 | number_hb_3m == 0) %>%  # Keep all 1s, or 0s if no 1 exists
+  # Step 4: dplyr::select best row per patient
+  dplyr::group_by(study_subject_id) %>%
+  arrange(desc(hb_date)) %>%  # Prioritise most recent date
+  dplyr::slice(1) %>%
+  ungroup() %>%
+  # Step 5: If value not 90d prior make NA
+  mutate(hb_value = if_else(hb_3m_yn == 1, hb_value, NA, missing = NA))
+
+# Delta Hb
+cirrho_ida_ml <- cirrho_ida_ml %>%
+  mutate(delta_hb = ifelse(number_hb_3m >=1, hb_fer_value - hb_value, NA))
+
+# Remove unecessary columns
+cirrho_ida_ml <- cirrho_ida_ml %>%
+  dplyr::select(-c(hb_date, hb_value, hb_3m_yn, number_hb_3m))
+
+
+
+# MCV during study window and within 90d prior or day of CFER
+# Filter all MCV during study to within study window
+
+# Convert both data frames to data.tables
+setDT(cirrho_mcv_during_study)
+setDT(cirrho_ida_cohort_final)
+
+# Perform efficient join and filtering for Hb results prior to endoffu
+cirrho_mcv_desc <- cirrho_mcv_during_study[cirrho_ida_cohort_final, on = "study_subject_id"][Date >= (inclusion_date - 90) & Date <= end_of_fu]%>%
+  rename(mcv_date = 'Date',
+         mcv_value = 'result_final')
+
+# Extract closest MCV to ferritin
+cirrho_ida_ml <- cirrho_ida_ml %>%
+  left_join(cirrho_mcv_desc %>% dplyr::select(study_subject_id, mcv_date, mcv_value), by = 'study_subject_id') %>%
+  mutate(mcv_cfer_diffdays = difftime(cfer_date, mcv_date, units = "days"),
+         mcv_cfer_yn = if_else (mcv_cfer_diffdays <= 90 & mcv_cfer_diffdays>=0, 1, 0, missing = 0 )
+  )  %>%
+  # Step 2: Assign patient-level outcome
+  group_by(study_subject_id) %>%
+  mutate(number_mcv_cfer = sum(mcv_cfer_yn)) %>%  # 1 if any row is 1, else 0
+  ungroup() %>%
+  # Step 3: Keep only relevant rows for filtering
+  filter(mcv_cfer_yn == 1 | number_mcv_cfer == 0) %>%  # Keep all 1s, or 0s if no 1 exists
+  # Step 4: dplyr::select best row per patient
+  group_by(study_subject_id) %>%
+  arrange(abs(mcv_cfer_diffdays), desc(mcv_cfer_diffdays)) %>%  # Prioritise smallest absolute date diff, prefer positive on ties (e.g +2 before -2)
+  dplyr::slice(1) %>%
+  ungroup() %>%
+  # Step 5: If value and date diff not within 90d prior make NA
+  mutate(mcv_value = if_else(mcv_cfer_yn == 1, mcv_value, NA, missing = NA),
+         mcv_cfer_diffdays = if_else(mcv_cfer_yn == 1, mcv_cfer_diffdays, NA, missing = NA))
+
+table(cirrho_ida_ml$mcv_cfer_yn) # only 9 have no mcv within 90d prior or day of ferritin (lost 4 by limiting to study window, additional 3 by keeping to 90d pre or day of)
+hist(as.numeric(cirrho_ida_ml$mcv_cfer_diffdays, units = "days"))
+summary(cirrho_ida_ml$mcv_cfer_diffdays)
+range(cirrho_ida_ml$mcv_cfer_diffdays, na.rm = TRUE)
+
+cirrho_ida_ml <- cirrho_ida_ml %>%
+  dplyr::rename(mcv_cfer_date = mcv_date,
+                mcv_cfer_value = mcv_value) %>%
+  dplyr::select(-c(mcv_cfer_diffdays, number_mcv_cfer)) # remove unnecessary columns
+
+
+# MCV > 90d prior
+
+# Filter all Hb during study to prior to endoffu
+# Convert both data frames to data.tables
+setDT(cirrho_mcv_during_study)
+setDT(cirrho_ida_cohort_final)
+
+# Perform efficient join and filtering for Hb results prior to endoffu
+cirrho_mcv_during_study <- cirrho_mcv_during_study %>%
+  rename(mcv_date = 'Date',
+         mcv_value = 'result_final')
+
+cirrho_ida_ml <- cirrho_ida_ml %>%
+  left_join(cirrho_mcv_during_study %>% dplyr::select(study_subject_id, mcv_date, mcv_value), by = 'study_subject_id') %>%
+  mutate(mcv_3m_yn = if_else (
+    difftime(mcv_cfer_date, mcv_date, units = "days") >= 90, 1, 0, missing = 0 )
+  )  %>%
+  # Step 2: Assign patient-level outcome
+  group_by(study_subject_id) %>%
+  mutate(number_mcv_3m = sum(mcv_3m_yn)) %>%  # 1 if any row is 1, else 0
+  ungroup() %>%
+  # Step 3: Keep only relevant rows for filtering
+  filter(mcv_3m_yn == 1 | number_mcv_3m == 0) %>%  # Keep all 1s, or 0s if no 1 exists
+  # Step 4: dplyr::select best row per patient
+  group_by(study_subject_id) %>%
+  arrange(desc(mcv_date)) %>%  # Prioritise most recent date
+  dplyr::slice(1) %>%
+  ungroup() %>%
+  # Step 5: If value not 90d prior make NA
+  mutate(mcv_value = if_else(mcv_3m_yn == 1, mcv_value, NA, missing = NA))
+
+
+table(cirrho_ida_ml$mcv_3m_yn) # n = 2850 have mcv >=90 day prior
+
+# check to see distribution of missingness in IDA y/n
+cirrho_ida_ml %>%
+  count(mcv_3m_yn, ida_yn) %>%
+  group_by(ida_yn) %>%
+  mutate(pct = 100 * n / sum(n))
+
+
+# Delta MCV
+cirrho_ida_ml <- cirrho_ida_ml %>%
+  mutate(delta_mcv = ifelse(mcv_3m_yn ==1 & mcv_cfer_yn == 1, mcv_cfer_value - mcv_value, NA))
+
+# Remove unnecessary columns
+cirrho_ida_ml <- cirrho_ida_ml %>%
+  dplyr::select(-c(mcv_cfer_yn, mcv_date, mcv_value, mcv_3m_yn, number_mcv_3m, mcv_cfer_date)) 
+
+# MCH within 90d prior or dya of CFER during study window
+
+# Filter all MCV during study to within study window
+# Convert both data frames to data.tables
+setDT(cirrho_mch_during_study)
+setDT(cirrho_ida_cohort_final)
+
+# Perform efficient join and filtering for Hb results prior to endoffu
+cirrho_mch_desc <- cirrho_mch_during_study[cirrho_ida_cohort_final, on = "study_subject_id"][Date >= (inclusion_date - 90) & Date <= end_of_fu]%>%
+  rename(mch_date = 'Date',
+         mch_value = 'result_final')
+
+
+# Add mch_value to Hb_fer based on matching study_subject_id and date within 90 days
+cirrho_ida_ml <- cirrho_ida_ml %>%
+  left_join(cirrho_mch_desc %>% dplyr::select(study_subject_id, mch_date, mch_value), by = 'study_subject_id') %>%
+  mutate(mch_cfer_diffdays = difftime(cfer_date, mch_date, units = "days"),
+         mch_cfer_yn = if_else (mch_cfer_diffdays <= 90 & mch_cfer_diffdays>=0, 1, 0, missing = 0 )
+  )  %>%
+  # Step 2: Assign patient-level outcome
+  group_by(study_subject_id) %>%
+  mutate(number_mch_cfer = sum(mch_cfer_yn)) %>%  # 1 if any row is 1, else 0
+  ungroup() %>%
+  # Step 3: Keep only relevant rows for filtering
+  filter(mch_cfer_yn == 1 | number_mch_cfer == 0) %>%  # Keep all 1s, or 0s if no 1 exists
+  # Step 4: dplyr::select best row per patient
+  group_by(study_subject_id) %>%
+  arrange(abs(mch_cfer_diffdays), desc(mch_cfer_diffdays)) %>%  # Prioritise smallest date diff then prioritise positives if ties
+  dplyr::slice(1) %>%
+  ungroup() %>%
+  # Step 5: If value and date diff not within 90d prior or 14d post make NA
+  mutate(mch_value = if_else(mch_cfer_yn == 1, mch_value, NA, missing = NA),
+         mch_cfer_diffdays = if_else(mch_cfer_yn == 1, mch_cfer_diffdays, NA, missing = NA))
+
+table(cirrho_ida_ml$mch_cfer_yn) # only 11 have no mch within 90d prior or 14d post ferritin (lost 4 by limiting to study window, addiitonal 2 not after cfer)
+hist(as.numeric(cirrho_ida_ml$mch_cfer_diffdays, units = "days"))
+summary(cirrho_ida_ml$mch_cfer_diffdays)
+range(cirrho_ida_ml$mch_cfer_diffdays, na.rm = TRUE)
+
+cirrho_ida_ml <- cirrho_ida_ml %>%
+  dplyr::rename(mch_cfer_date = mch_date,
+                mch_cfer_value = mch_value) %>%
+  dplyr::select(-c(mch_cfer_diffdays, number_mch_cfer)) # remove unnecessary columns
+
+
+# mch > 90d prior
+cirrho_mch_during_study <- cirrho_mch_during_study %>%
+  dplyr::rename(mch_date = Date,
+                mch_value = result_final)
+
+cirrho_ida_ml <- cirrho_ida_ml %>%
+  left_join(cirrho_mch_during_study %>% dplyr::select(study_subject_id, mch_date, mch_value), by = 'study_subject_id') %>%
+  mutate(mch_3m_yn = if_else (
+    difftime(mch_cfer_date, mch_date, units = "days") >= 90, 1, 0, missing = 0 )
+  )  %>%
+  # Step 2: Assign patient-level outcome
+  group_by(study_subject_id) %>%
+  mutate(number_mch_3m = sum(mch_3m_yn)) %>%  # 1 if any row is 1, else 0
+  ungroup() %>%
+  # Step 3: Keep only relevant rows for filtering
+  filter(mch_3m_yn == 1 | number_mch_3m == 0) %>%  # Keep all 1s, or 0s if no 1 exists
+  # Step 4: dplyr::select best row per patient
+  group_by(study_subject_id) %>%
+  arrange(desc(mch_date)) %>%  # Prioritise most recent date
+  dplyr::slice(1) %>%
+  ungroup() %>%
+  # Step 5: If value not 90d prior make NA
+  mutate(mch_value = if_else(mch_3m_yn == 1, mch_value, NA, missing = NA))
+
+
+table(cirrho_ida_ml$mch_3m_yn) # n = 2850 
+
+# Delta mch
+cirrho_ida_ml <- cirrho_ida_ml %>%
+  mutate(delta_mch = ifelse(mch_3m_yn ==1 & mch_cfer_yn == 1, mch_cfer_value - mch_value, NA))
+
+# Remove unnecessary columns
+cirrho_ida_ml <- cirrho_ida_ml %>%
+  dplyr::select(-c(mch_cfer_yn, mch_date, mch_value, mch_3m_yn, number_mch_3m, mch_cfer_date)) 
+
+
+
+# Pl within 90d ferritin
+
+# Add pl_value to cfer based on matching study_subject_id and date within 90 days prior or day of within study window
+
+# Filter all MCV during study to within study window
+# Convert both data frames to data.tables
+setDT(cirrho_pl_during_study)
+setDT(cirrho_ida_cohort_final)
+
+# Perform efficient join and filtering for Hb results prior to endoffu
+cirrho_pl_desc <- cirrho_pl_during_study[cirrho_ida_cohort_final, on = "study_subject_id"][Date >= (inclusion_date - 90) & Date <= end_of_fu]%>%
+  rename(pl_date = 'Date',
+         pl_value = 'PL_clinical')
+
+
+cirrho_ida_ml <- cirrho_ida_ml %>%
+  left_join(cirrho_pl_desc %>% dplyr::select(study_subject_id, pl_date, pl_value), by = 'study_subject_id') %>%
+  mutate(pl_cfer_diffdays = difftime(cfer_date, pl_date, units = "days"),
+         pl_cfer_yn = if_else (pl_cfer_diffdays <= 90 & pl_cfer_diffdays>=0, 1, 0, missing = 0 )
+  )  %>%
+  # Step 2: Assign patient-level outcome
+  group_by(study_subject_id) %>%
+  mutate(number_pl_cfer = sum(pl_cfer_yn)) %>%  # 1 if any row is 1, else 0
+  ungroup() %>%
+  # Step 3: Keep only relevant rows for filtering
+  filter(pl_cfer_yn == 1 | number_pl_cfer == 0) %>%  # Keep all 1s, or 0s if no 1 exists
+  # Step 4: dplyr::select best row per patient
+  group_by(study_subject_id) %>%
+  arrange(abs(pl_cfer_diffdays), desc(pl_cfer_diffdays)) %>%  # Prioritise smallest date diff then by positive if ties
+  dplyr::slice(1) %>%
+  ungroup() %>%
+  # Step 5: If value and date diff not within 90d prior or 14d post make NA
+  mutate(pl_value = if_else(pl_cfer_yn == 1, pl_value, NA, missing = NA),
+         pl_cfer_diffdays = if_else(pl_cfer_yn == 1, pl_cfer_diffdays, NA, missing = NA))
+
+table(cirrho_ida_ml$pl_cfer_yn) # only 9 have no pl within 90d of cfer (same, 3 less without using results after cfer)
+hist(as.numeric(cirrho_ida_ml$pl_cfer_diffdays, units = "days"))
+summary(cirrho_ida_ml$pl_cfer_diffdays)
+range(cirrho_ida_ml$pl_cfer_diffdays, na.rm = TRUE)
+
+cirrho_ida_ml <- cirrho_ida_ml %>%
+  dplyr::rename(pl_fer_date = pl_date,
+                pl_fer_value = pl_value) %>%
+  dplyr::select(-c(pl_cfer_diffdays, number_pl_cfer)) # remove unnecessary columns
+
+
+# pl > 90d prior
+cirrho_pl_during_study <- cirrho_pl_during_study %>%
+  dplyr::rename(pl_date = Date,
+                pl_value = PL_clinical)
+
+cirrho_ida_ml <- cirrho_ida_ml %>%
+  left_join(cirrho_pl_during_study %>% dplyr::select(study_subject_id, pl_date, pl_value), by = 'study_subject_id') %>%
+  mutate(pl_3m_yn = if_else (
+    difftime(pl_fer_date, pl_date, units = "days") >= 90, 1, 0, missing = 0 )
+  )  %>%
+  # Step 2: Assign patient-level outcome
+  group_by(study_subject_id) %>%
+  mutate(number_pl_3m = sum(pl_3m_yn)) %>%  # 1 if any row is 1, else 0
+  ungroup() %>%
+  # Step 3: Keep only relevant rows for filtering
+  filter(pl_3m_yn == 1 | number_pl_3m == 0) %>%  # Keep all 1s, or 0s if no 1 exists
+  # Step 4: dplyr::select best row per patient
+  group_by(study_subject_id) %>%
+  arrange(desc(pl_date)) %>%  # Prioritise most recent date
+  dplyr::slice(1) %>%
+  ungroup() %>%
+  # Step 5: If value not 90d prior make NA
+  mutate(pl_value = if_else(pl_3m_yn == 1, pl_value, NA, missing = NA))
+
+
+table(cirrho_ida_ml$pl_3m_yn) # n = 2847 pl within 3m 
+
+# Delta pl # NB unlikely clinically useful
+cirrho_ida_ml <- cirrho_ida_ml %>%
+  mutate(delta_pl = ifelse(pl_3m_yn ==1 & pl_cfer_yn == 1, pl_fer_value - pl_value, NA))
+
+# remove columns
+cirrho_ida_ml <- cirrho_ida_ml %>%
+  dplyr::select(-c(pl_cfer_yn, pl_date, pl_value, pl_3m_yn, number_pl_3m, pl_fer_date)) 
+
+# INR (within 90d ferritin)
+
+# Filter all INR during study to within study window
+# Convert both data frames to data.tables
+setDT(cirrho_hinr_during_study)
+setDT(cirrho_ida_cohort_final)
+
+# Perform efficient join and filtering for Hb results prior to endoffu
+cirrho_hinr_desc <- cirrho_hinr_during_study[cirrho_ida_cohort_final, on = "study_subject_id"][Date >= (inclusion_date - 90) & Date <= end_of_fu]%>%
+  rename(hinr_date = 'Date',
+         hinr_value = 'HINR_clinical')
+
+
+cirrho_ida_ml <- cirrho_ida_ml %>%
+  left_join(cirrho_hinr_desc %>% dplyr::select(study_subject_id, hinr_date, hinr_value), by = 'study_subject_id') %>%
+  mutate(hinr_cfer_diffdays = difftime(cfer_date, hinr_date, units = "days"),
+         hinr_cfer_yn = if_else (hinr_cfer_diffdays <= 90 & hinr_cfer_diffdays >=0, 1, 0, missing = 0)
+  )  %>%
+  # Step 2: Assign patient-level outcome
+  group_by(study_subject_id) %>%
+  mutate(patient_level_hinr_cfer = max(hinr_cfer_yn)) %>%  # 1 if any row is 1, else 0
+  ungroup() %>%
+  # Step 3: Keep only relevant rows for filtering
+  filter(hinr_cfer_yn == 1 | patient_level_hinr_cfer == 0) %>%  # Keep all 1s, or 0s if no 1 exists
+  # Step 4: dplyr::select best row per patient
+  group_by(study_subject_id) %>%
+  arrange(abs(hinr_cfer_diffdays), desc(hinr_cfer_diffdays)) %>%  # Prioritise smallest date diff then prioritise positive
+  dplyr::slice(1) %>%
+  ungroup() %>%
+  # Step 5: If value not within 90d make NA
+  mutate(hinr_value = if_else(hinr_cfer_yn == 1, hinr_value, NA, missing = NA),
+         hinr_cfer_diffdays = if_else(hinr_cfer_yn == 1, hinr_cfer_diffdays, NA, missing = NA))
+
+table(cirrho_ida_ml$hinr_cfer_yn) # 712 have no INR within 90d of cfer (addiitonal308 lost)
+hist(as.numeric(cirrho_ida_ml$hinr_cfer_diffdays, units = "days"))
+summary(cirrho_ida_ml$hinr_cfer_diffdays)
+range(cirrho_ida_ml$hinr_cfer_diffdays, na.rm = TRUE)
+
+cirrho_ida_ml <- cirrho_ida_ml %>%
+  dplyr::select(-c(hinr_cfer_diffdays, patient_level_hinr_cfer, hinr_date, hinr_cfer_diffdays, hinr_cfer_yn)) # remove unnecessary columns
+
+
+# CRP within 2 weeks of ferritin
+
+# Filter all INR during study to within study window
+# Convert both data frames to data.tables
+setDT(cirrho_crp_during_study)
+setDT(cirrho_ida_cohort_final)
+
+# Perform efficient join and filtering for Hb results prior to endoffu
+cirrho_crp_desc <- cirrho_crp_during_study[cirrho_ida_cohort_final, on = "study_subject_id"][Date >= (inclusion_date - 90) & Date <= end_of_fu]%>%
+  rename(crp_date = 'Date',
+         crp_value = 'result_final')
+
+
+cirrho_ida_ml <- cirrho_ida_ml %>%
+  left_join(cirrho_crp_desc %>% dplyr::select(study_subject_id, crp_date, crp_value), by = 'study_subject_id') %>%
+  mutate(crp_cfer_diffdays = difftime(cfer_date, crp_date, units = "days"),
+         crp_cfer_yn = if_else (crp_cfer_diffdays <= 14 & crp_cfer_diffdays >=0, 1, 0, missing = 0)
+  )  %>%
+  # Step 2: Assign patient-level outcome
+  group_by(study_subject_id) %>%
+  mutate(patient_level_crp_cfer = max(crp_cfer_yn)) %>%  # 1 if any row is 1, else 0
+  ungroup() %>%
+  # Step 3: Keep only relevant rows for filtering
+  filter(crp_cfer_yn == 1 | patient_level_crp_cfer == 0) %>%  # Keep all 1s, or 0s if no 1 exists
+  # Step 4: dplyr::select best row per patient
+  group_by(study_subject_id) %>%
+  arrange(abs(crp_cfer_diffdays), desc(crp_cfer_diffdays)) %>%  # Prioritise smallest date diff, positive if ties
+  dplyr::slice(1) %>%
+  ungroup() %>%
+  # Step 5: If value not within 90d make NA
+  mutate(crp_value = if_else(crp_cfer_yn == 1, crp_value, NA, missing = NA),
+         crp_cfer_diffdays = if_else(crp_cfer_yn == 1, crp_cfer_diffdays, NA, missing = NA))
+
+table(cirrho_ida_ml$crp_cfer_yn) # 1539 have no CRP within 90d of cfer (additional 233 lost)
+hist(as.numeric(cirrho_ida_ml$crp_cfer_diffdays, units = "days"))
+summary(cirrho_ida_ml$crp_cfer_diffdays)
+range(cirrho_ida_ml$crp_cfer_diffdays, na.rm = TRUE)
+
+cirrho_ida_ml <- cirrho_ida_ml %>%
+  dplyr::select(-c(crp_cfer_diffdays, patient_level_crp_cfer, crp_date, crp_cfer_diffdays, crp_cfer_yn)) # remove unnecessary columns
+
+# Creat (closest within 90d ferritin)
+
+# Filter all creat during study to within study window
+# Convert both data frames to data.tables
+setDT(cirrho_creat_during_study)
+setDT(cirrho_ida_cohort_final)
+
+# Perform efficient join and filtering for Hb results prior to endoffu
+cirrho_creat_desc <- cirrho_creat_during_study[cirrho_ida_cohort_final, on = "study_subject_id"][Date >= (inclusion_date - 90) & Date <= end_of_fu]%>%
+  rename(creat_date = 'Date',
+         creat_value = 'result_final')
+
+cirrho_ida_ml <- cirrho_ida_ml %>%
+  left_join(cirrho_creat_desc %>% dplyr::select(study_subject_id, creat_date, creat_value), by = 'study_subject_id') %>%
+  mutate(creat_cfer_diffdays = difftime(cfer_date, creat_date, units = "days"),
+         creat_cfer_yn = if_else (creat_cfer_diffdays <= 90 &creat_cfer_diffdays >=0, 1, 0, missing = 0)
+  )  %>%
+  # Step 2: Assign patient-level outcome
+  group_by(study_subject_id) %>%
+  mutate(patient_level_creat_cfer = max(creat_cfer_yn)) %>%  # 1 if any row is 1, else 0
+  ungroup() %>%
+  # Step 3: Keep only relevant rows for filtering
+  filter(creat_cfer_yn == 1 | patient_level_creat_cfer == 0) %>%  # Keep all 1s, or 0s if no 1 exists
+  # Step 4: dplyr::select best row per patient
+  group_by(study_subject_id) %>%
+  arrange(abs(creat_cfer_diffdays), desc(creat_cfer_diffdays)) %>%  # Prioritise smallest date diff then prioritise positive if ties
+  dplyr::slice(1) %>%
+  ungroup() %>%
+  # Step 5: If value not within 180d make NA
+  mutate(creat_value = if_else(creat_cfer_yn == 1, creat_value, NA, missing = NA),
+         creat_cfer_diffdays = if_else(creat_cfer_yn == 1, creat_cfer_diffdays, NA, missing = NA))
+
+table(cirrho_ida_ml$creat_cfer_yn) # n= 1367 no creat within 90d cfer (NB 1432 have no creat within 180d of cfer, additional 6 lost by not including results post cfer)
+hist(as.numeric(cirrho_ida_ml$creat_cfer_diffdays, units = "days"))
+summary(cirrho_ida_ml$creat_cfer_diffdays)
+range(cirrho_ida_ml$creat_cfer_diffdays, na.rm = TRUE)
+
+cirrho_ida_ml <- cirrho_ida_ml %>%
+  dplyr::select(-c(creat_cfer_diffdays, patient_level_creat_cfer, creat_date, creat_cfer_diffdays, creat_cfer_yn)) # remove unnecessary colum
+
+# Bilirubin (closest within 90d to ferritin)
+
+# Filter all bili during study to within study window
+# Convert both data frames to data.tables
+setDT(cirrho_bili_during_study)
+setDT(cirrho_ida_cohort_final)
+
+# Perform efficient join and filtering for Hb results prior to endoffu
+cirrho_bili_desc <- cirrho_bili_during_study[cirrho_ida_cohort_final, on = "study_subject_id"][Date >= (inclusion_date - 90) & Date <= end_of_fu]%>%
+  rename(bili_date = 'Date',
+         bili_value = 'result_final')
+
+cirrho_ida_ml <- cirrho_ida_ml %>%
+  left_join(cirrho_bili_desc %>% dplyr::select(study_subject_id, bili_date, bili_value), by = 'study_subject_id') %>%
+  mutate(bili_cfer_diffdays = difftime(cfer_date, bili_date, units = "days"),
+         bili_cfer_yn = if_else (bili_cfer_diffdays <= 90 & bili_cfer_diffdays >=0, 1, 0, missing = 0)
+  )  %>%
+  # Step 2: Assign patient-level outcome
+  group_by(study_subject_id) %>%
+  mutate(patient_level_bili_cfer = max(bili_cfer_yn)) %>%  # 1 if any row is 1, else 0
+  ungroup() %>%
+  # Step 3: Keep only relevant rows for filtering
+  filter(bili_cfer_yn == 1 | patient_level_bili_cfer == 0) %>%  # Keep all 1s, or 0s if no 1 exists
+  # Step 4: dplyr::select best row per patient
+  group_by(study_subject_id) %>%
+  arrange(abs(bili_cfer_diffdays), desc(bili_cfer_diffdays)) %>%  # Prioritise smallest date diff then prioritise positive if ties
+  dplyr::slice(1) %>%
+  ungroup() %>%
+  # Step 5: If value not within 90d make NA
+  mutate(bili_value = if_else(bili_cfer_yn == 1, bili_value, NA, missing = NA),
+         bili_cfer_diffdays = if_else(bili_cfer_yn == 1, bili_cfer_diffdays, NA, missing = NA))
+
+table(cirrho_ida_ml$bili_cfer_yn) # n= 141 no bili within 90d cfer (additional 15 lost not using results post cfer)
+hist(as.numeric(cirrho_ida_ml$bili_cfer_diffdays, units = "days"))
+summary(cirrho_ida_ml$bili_cfer_diffdays)
+range(cirrho_ida_ml$bili_cfer_diffdays, na.rm = TRUE)
+
+cirrho_ida_ml <- cirrho_ida_ml %>%
+  dplyr::select(-c(bili_cfer_diffdays, patient_level_bili_cfer, bili_date, bili_cfer_diffdays, bili_cfer_yn)) # remove unnecessary column
+
+
+# Bmi (closest within 90d to ferritin)
+# Filter all BMI during study to within study window
+# Convert both data frames to data.tables
+setDT(bmi_cirrho)
+setDT(cirrho_ida_cohort_final)
+
+# Perform efficient join and filtering for Hb results prior to endoffu
+cirrho_bmi_desc <- bmi_cirrho[cirrho_ida_cohort_final, on = "study_subject_id"][date >= (inclusion_date - 90) & date <= end_of_fu]%>%
+  rename(bmi_date = 'date',
+         bmi_value = 'final_value')
+
+
+cirrho_ida_ml <- cirrho_ida_ml %>%
+  left_join(cirrho_bmi_desc %>% dplyr::select(study_subject_id, bmi_date, bmi_value), by = 'study_subject_id') %>%
+  mutate(bmi_cfer_diffdays = difftime(cfer_date, bmi_date, units = "days"),
+         bmi_cfer_yn = if_else (bmi_cfer_diffdays <= 90 & bmi_cfer_diffdays >=-90, 1, 0, missing = 0)
+  )  %>%
+  # Step 2: Assign patient-level outcome
+  group_by(study_subject_id) %>%
+  mutate(patient_level_bmi_cfer = max(bmi_cfer_yn)) %>%  # 1 if any row is 1, else 0
+  ungroup() %>%
+  # Step 3: Keep only relevant rows for filtering
+  filter(bmi_cfer_yn == 1 | patient_level_bmi_cfer == 0) %>%  # Keep all 1s, or 0s if no 1 exists
+  # Step 4: dplyr::select best row per patient
+  group_by(study_subject_id) %>%
+  arrange(abs(bmi_cfer_diffdays), desc(bmi_cfer_diffdays)) %>%  # Prioritise smallest date diff then by most recent date
+  dplyr::slice(1) %>%
+  ungroup() %>%
+  # Step 5: If value not within 90d make NA
+  mutate(bmi_value = if_else(bmi_cfer_yn == 1, bmi_value, NA, missing = NA),
+         bmi_cfer_diffdays = if_else(bmi_cfer_yn == 1, bmi_cfer_diffdays, NA, missing = NA))
+
+table(cirrho_ida_ml$bmi_cfer_yn) # n= 1857 no bmi within 90d cfer
+hist(as.numeric(cirrho_ida_ml$bmi_cfer_diffdays, units = "days"))
+summary(cirrho_ida_ml$bmi_cfer_diffdays)
+range(cirrho_ida_ml$bmi_cfer_diffdays, na.rm = TRUE)
+
+cirrho_ida_ml <- cirrho_ida_ml %>%
+  dplyr::select(-c(bmi_cfer_diffdays, patient_level_bmi_cfer, bmi_date, bmi_cfer_yn)) # remove unnecessary column
+
+# wbc (closest within 90d to ferritin)
+
+# Filter all wbc during study to within study window
+# Convert both data frames to data.tables
+#setDT(cirrho_wbc_during_study)
+#setDT(cirrho_ida_cohort_final)
+
+# Perform efficient join and filtering for Hb results prior to endoffu
+#cirrho_wbc_desc <- cirrho_wbc_during_study[cirrho_ida_cohort_final, on = "study_subject_id"][Date >= (inclusion_date - 90) & Date <= end_of_fu]%>%
+#  rename(wbc_date = 'Date',
+#         wbc_value = 'result_final')
+
+# Add wbc_value to cfer based on matching study_subject_id and closest date
+#cirrho_ida_ml <- cirrho_ida_ml %>%
+#  left_join(cirrho_wbc_desc %>% dplyr::select(study_subject_id, wbc_date, wbc_value), by = 'study_subject_id') %>%
+#  mutate(wbc_cfer_diffdays = difftime(cfer_date, wbc_date, units = "days"),
+#         wbc_cfer_yn = if_else (wbc_cfer_diffdays <= 90 & wbc_cfer_diffdays >=0, 1, 0, missing = 0)
+#  )  %>%
+  # Step 2: Assign patient-level outcome
+#  group_by(study_subject_id) %>%
+#  mutate(patient_level_wbc_cfer = max(wbc_cfer_yn)) %>%  # 1 if any row is 1, else 0
+#  ungroup() %>%
+  # Step 3: Keep only relevant rows for filtering
+#  filter(wbc_cfer_yn == 1 | patient_level_wbc_cfer == 0) %>%  # Keep all 1s, or 0s if no 1 exists
+  # Step 4: dplyr::select best row per patient
+#  group_by(study_subject_id) %>%
+#  arrange(abs(wbc_cfer_diffdays), desc(wbc_cfer_diffdays)) %>%  # Prioritise smallest date diff then by most recent date
+#  dplyr::slice(1) %>%
+#  ungroup() %>%
+  # Step 5: If value not within 90d make NA
+#  mutate(wbc_value = if_else(wbc_cfer_yn == 1, wbc_value, NA, missing = NA),
+#         wbc_cfer_diffdays = if_else(wbc_cfer_yn == 1, wbc_cfer_diffdays, NA, missing = NA))
+
+#table(cirrho_ida_ml$wbc_cfer_yn) # n= 839 no wbc within 90d cfer (same)
+#hist(as.numeric(cirrho_ida_ml$wbc_cfer_diffdays, units = "days"))
+#summary(cirrho_ida_ml$wbc_cfer_diffdays)
+#range(cirrho_ida_ml$wbc_cfer_diffdays, na.rm = TRUE)
+
+#cirrho_ida_ml <- cirrho_ida_ml %>%
+#  dplyr::select(-c(wbc_cfer_diffdays, patient_level_wbc_cfer, wbc_date, wbc_cfer_diffdays, wbc_cfer_yn)) # remove unnecessary column
+
+# neut (closest within 90d to ferritin)
+
+# Convert both data frames to data.tables
+setDT(cirrho_neut_during_study)
+setDT(cirrho_ida_cohort_final)
+
+# Perform efficient join and filtering for Hb results prior to endoffu
+cirrho_neut_desc <- cirrho_neut_during_study[cirrho_ida_cohort_final, on = "study_subject_id"][Date >= (inclusion_date - 90) & Date <= end_of_fu]%>%
+  rename(neut_date = 'Date',
+         neut_value = 'result_final')
+
+# Add neut_value to cfer based on matching study_subject_id and closest date
+
+cirrho_ida_ml <- cirrho_ida_ml %>%
+  left_join(cirrho_neut_desc %>% dplyr::select(study_subject_id, neut_date, neut_value), by = 'study_subject_id') %>%
+  mutate(neut_cfer_diffdays = difftime(cfer_date, neut_date, units = "days"),
+         neut_cfer_yn = if_else (neut_cfer_diffdays <= 90 & neut_cfer_diffdays >=0, 1, 0, missing = 0)
+  )  %>%
+  # Step 2: Assign patient-level outcome
+  group_by(study_subject_id) %>%
+  mutate(patient_level_neut_cfer = max(neut_cfer_yn)) %>%  # 1 if any row is 1, else 0
+  ungroup() %>%
+  # Step 3: Keep only relevant rows for filtering
+  filter(neut_cfer_yn == 1 | patient_level_neut_cfer == 0) %>%  # Keep all 1s, or 0s if no 1 exists
+  # Step 4: dplyr::select best row per patient
+  group_by(study_subject_id) %>%
+  arrange(abs(neut_cfer_diffdays), desc(neut_cfer_diffdays)) %>%  # Prioritise smallest date diff then by most recent date
+  dplyr::slice(1) %>%
+  ungroup() %>%
+  # Step 5: If value not within 90d make NA
+  mutate(neut_value = if_else(neut_cfer_yn == 1, neut_value, NA, missing = NA),
+         neut_cfer_diffdays = if_else(neut_cfer_yn == 1, neut_cfer_diffdays, NA, missing = NA))
+
+table(cirrho_ida_ml$neut_cfer_yn) # n= 458 no neut within 90d cfer
+hist(as.numeric(cirrho_ida_ml$neut_cfer_diffdays, units = "days"))
+summary(cirrho_ida_ml$neut_cfer_diffdays)
+range(cirrho_ida_ml$neut_cfer_diffdays, na.rm = TRUE)
+IQR(cirrho_ida_ml$neut_cfer_diffdays, na.rm = TRUE)
+
+cirrho_ida_ml <- cirrho_ida_ml %>%
+  dplyr::select(-c(neut_cfer_diffdays, patient_level_neut_cfer, neut_date, neut_cfer_diffdays, neut_cfer_yn)) # remove unnecessary column
+
+
+# Move outcome to end
+cirrho_ida_ml <- cirrho_ida_ml %>%
+  relocate(ida_yn, .after = last_col())
+
+
+# CCA and predicted useful variables for ML
+ml_cca <- cirrho_ida_ml %>%
+  filter(!is.na(delta_hb) & !is.na(mcv_cfer_value) & !is.na(delta_mcv) & !is.na(pl_fer_value)) %>%
+  dplyr::select(c(study_subject_id, gender_id_uncoded, ethnic_group, age, hb_fer_value, delta_hb, mcv_cfer_value, delta_mcv, pl_fer_value, cfer_value, ida_yn))
+
+table(ml_cca$ida_yn) # total n = 2835, no ida n = 2252, ida n = 583 (lost 9 patients from CCA)
+
+
+# explore cirrhosis diagnoses
+#cirrho_cohort_diagnoses <- cirrho_cohort_final %>%
+#  left_join(icd_diagnosis.data, by = 'study_subject_id') %>%
+#  filter(cirrhosis_icd == 1 | cirrhosis_desc ==1 | cirrhosis_snomed ==1) %>%
+#  dplyr::select(study_subject_id, date_diagnosis, icd_code, cirrhosis_icd_date, snomed_code, cirrhosis_snomed_date, diagnosis_description, cirrhosis_desc_date) #%>%
+#summarise(n_distinct(study_subject_id)) # n = 5302
+
+#table(cirrho_cohort_diagnoses$icd_code)
+
+# Coded bleeding varices (up to date of ferritin) - icd - I850, I864, I982, snomedct - , diag desc - bleed varice
+# Cause of cirrhosis
+# Evidence decomp/comp (up to date of ferritin)
+
+### All with IDA vs not
+table(cirrho_ida_ml$ida_yn) # n = 654
+
+#### Anaemic patients as total cohort ?limit to those with anaemia
+#anaemia_cirrho_ida_ml <- cirrho_ida_ml %>%
+# filter(hb_fer_value <= 130)  # n = 2343
+#table(anaemia_cirrho_ida_ml$ida_yn) # ida = 778 no ida = 1554
+
+
+
+##### Descriptive groups -----------------------------------------------------------------------------------
+
+# Table one for IDA vs No IDA ------------------------------------------------------------------------------
+
+# Set factor levels
+cirrho_ida_ml$ethnic_group <- factor(cirrho_ida_ml$ethnic_group, levels = c("White","Asian","Black","Mixed","Other","Not stated"))
+
+# Define variable lists
+cat_vars_ml <- names(cirrho_ida_ml)[grepl("gender|ethnic", names(cirrho_ida_ml), ignore.case = TRUE)]
+cont_vars_ml <- c("age", "hb_fer_value", "delta_hb", "mcv_cfer_value", "delta_mcv", "mch_cfer_value", "delta_mch", "pl_fer_value", "delta_pl", "hinr_value", "bili_value", "bmi_value", "crp_value", "creat_value", "neut_value")
+
+
+# Define non-normal vars (from histograms)
+nonnormal_vars <- c('bili_value','creat_value','crp_value','hinr_value','neut_value','pl_fer_value')
+
+
+library(tableone)
+table_one_ml <- CreateTableOne(vars = c(cat_vars_ml, cont_vars_ml), 
+                               strata = "ida_yn",
+                               includeNA = F, 
+                               data = cirrho_ida_ml, 
+                               test = F,
+                               addOverall = F)
+summary(table_one_ml)
+print(table_one_ml, nonnormal = nonnormal_vars, showAllLevels = T, missing = T)
+
+# Convert TableOne to a data frame (or matrix)
+table_one_ml_df <- as.data.frame(print(table_one_ml, nonnormal = nonnormal_vars, quote = FALSE, noSpaces = TRUE, showAllLevels = T, missing = T))
+
+# Export the data frame to CSV
+write.csv(table_one_ml_df, "table_one_ml_no_prior.csv", row.names = T)
+# Bmi, creat not as signif (P>0.01), ethnicity, age, plt, delta plt and INR p>0.05
+# Keep age regardless as relevant to threshold
+
+# Continuous variables----------------------------------------------------------------------------------
+
+# Select numeric variables excluding 'ida_yn'
+cirrho_ida_ml_long <- cirrho_ida_ml %>%
+  pivot_longer(cols = c(age, hb_fer_value, delta_hb, mcv_cfer_value, delta_mcv, mch_cfer_value, delta_mch, pl_fer_value, delta_pl, hinr_value, bili_value, bmi_value, crp_value, creat_value, neut_value), 
+               names_to = "Variable", 
+               values_to = "Value")
+
+# Summarise 
+summary(cirrho_ida_ml)
+
+# Checking normality
+
+# Shapiro test
+# Pick out numeric (continuous) variables
+num_vars <- sapply(cirrho_ida_ml, is.numeric)
+
+# Run Shapiro-Wilk test on each numeric variable
+shapiro_list <- lapply(cirrho_ida_ml[, num_vars], shapiro.test)
+
+# Tidy the results into a data frame
+shapiro_results <- data.frame(
+  variable = names(shapiro_list),
+  W        = sapply(shapiro_list, function(x) unname(x$statistic)),
+  p_value  = sapply(shapiro_list, function(x) x$p.value),
+  row.names = NULL
+)
+
+shapiro_results # significant for all (!!)
+
+# Histogram for all continuous variables
+ggplot(cirrho_ida_ml_long, aes(x = Value)) +
+  geom_histogram(bins = 30, fill = "steelblue", color = "black", alpha = 0.7) +
+  facet_wrap(~Variable, scales = "free") +
+  labs(title = "Histograms of Variables",
+       x = "Value",
+       y = "Count") +
+  theme_minimal()
+
+# QQ plots of all continuous variables
+# Select numeric (continuous) variables
+num_vars <- sapply(cirrho_ida_ml, is.numeric)
+num_names <- names(cirrho_ida_ml)[num_vars]
+
+# Set layout: e.g. 2x2 plots per page
+par(mfrow = c(2, 2))
+
+for (v in num_names) {
+  qqnorm(cirrho_ida_ml[[v]], 
+         main = paste("Q-Q plot of", v))
+  qqline(cirrho_ida_ml[[v]])
+}
+
+
+# Non-normal: bili, creatinine, crp, inr (hinr),bmi (NB ferritin excluded as not covariate)  
+# Some positive skew neut, plt
+# NB creat, crp, bmi excluded due to missingness
+# **remaining non-normal predictors are bili, inr, neut, plt**
+
+# Log transform non-normal variable within cirrho_ida_ml
+#cirrho_ida_ml <- cirrho_ida_ml %>%
+#  mutate(across(
+#    .cols = all_of(c('bili_value','creat_value','crp_value','hinr_value','neut_value','pl_fer_value')),
+#    .fns = ~ if_else(.x > 0, log(.x), NA_real_), # exclude any '0' results (only single neut result)
+#    .names = "log_{.col}"
+#  ))
+
+# Return to long format with included predictors
+#cirrho_ida_ml_long <- cirrho_ida_ml %>%
+#  select(-any_of(c('bili_value','creat_value','crp_value','hinr_value','neut_value','pl_fer_value','bmi_value','log_crp_value','log_creat_value'))) %>%
+#  pivot_longer(cols = c(age, hb_fer_value, delta_hb, mcv_cfer_value, delta_mcv, mch_cfer_value, delta_mch, log_pl_fer_value, delta_pl, log_hinr_value, log_bili_value, log_neut_value), 
+#               names_to = "Variable", 
+#               values_to = "Value")
+
+# Histogram for normal and transformed variables
+#ggplot(cirrho_ida_ml_long, aes(x = Value)) +
+#  geom_histogram(bins = 30, fill = "steelblue", color = "black", alpha = 0.7) +
+#  facet_wrap(~Variable, scales = "free") +
+#  labs(title = "Histograms of Variables",
+#       x = "Value",
+#       y = "Count") +
+#  theme_minimal()
+
+# Filter for selected predictor variables
+cirrho_ida_ml_long <- cirrho_ida_ml %>%
+  select(-any_of(c('creat_value','crp_value','bmi_value'))) %>%
+  pivot_longer(cols = c(age, hb_fer_value, delta_hb, mcv_cfer_value, delta_mcv, mch_cfer_value, delta_mch, pl_fer_value, delta_pl, hinr_value, bili_value, neut_value), 
+               names_to = "Variable", 
+               values_to = "Value")
+
+
+# 1. Define which variables are "normal" (t-test) and "non-normal" (Wilcoxon)
+normal_vars <- c("age", "delta_hb", "delta_mch", "delta_mcv",
+                 "delta_pl", "hb_fer_value", "mch_cfer_value", "mcv_cfer_value")
+
+nonnormal_vars <- c("bili_value", "hinr_value", "neut_value", "pl_fer_value")
+
+# 2. Function to perform the appropriate test per variable
+perform_tests <- function(df) {
+  df %>%
+    group_by(Variable) %>%
+    group_modify(~ {
+      var_name <- .y$Variable[[1]]
+      
+      if (var_name %in% normal_vars) {
+        # t-test for normally distributed variables
+        res <- t.test(Value ~ ida_yn, data = .x)
+        tibble(
+          test_type   = "t_test",
+          p_value     = res$p.value
+        )
+        
+      } else if (var_name %in% nonnormal_vars) {
+        # Wilcoxon rank-sum test for non-normal variables
+        res <- wilcox.test(Value ~ ida_yn, data = .x, exact = FALSE)
+        tibble(
+          test_type   = "wilcox",
+          p_value     = res$p.value
+        )
+        
+      } else {
+        # Optional: if a variable is in neither list
+        tibble(
+          test_type   = NA_character_,
+          p_value     = NA_real_
+        )
+      }
+    }) %>%
+    ungroup() %>%
+    mutate(
+      significance = case_when(
+        is.na(p_value)        ~ "",
+        p_value < 0.001       ~ "***",
+        p_value < 0.01        ~ "**",
+        p_value < 0.05        ~ "*",
+        TRUE                  ~ "ns"
+      )
+    )
+}
+
+# 3. Run test function on your long data
+test_results <- perform_tests(cirrho_ida_ml_long)
+print(test_results)
+
+# 4. Merge the significance results with the original long dataset (if you want it there too)
+cirrho_ida_ml_long <- cirrho_ida_ml_long %>%
+  left_join(test_results, by = "Variable")
+
+# 5. Get max y per Variable for label positioning
+test_results <- test_results %>%
+  left_join(
+    cirrho_ida_ml_long %>%
+      group_by(Variable) %>%
+      summarise(y_max = max(Value, na.rm = TRUE), .groups = "drop"),
+    by = "Variable"
+  )
+
+# 6. Updated ggplot with stars and correct tests (and formatted a bit)
+ggplot(
+  cirrho_ida_ml_long,
+  aes(x = factor(ida_yn), y = Value, fill = factor(ida_yn))
+) +
+  # background purple dots (observations)
+  geom_jitter(
+    color = "purple3",
+    alpha = 0.3,
+    width = 0.1,
+    size  = 0.8,
+    show.legend = FALSE
+  ) +
+  # boxplots on top: narrower + thicker outline
+  geom_boxplot(
+    outlier.shape = NA,
+    width  = 0.4,
+    colour = "black",
+    size   = 0.7
+  ) +
+  facet_wrap(
+    ~ Variable,
+    scales = "free",
+    ncol = 6        # <- more columns = each panel narrower
+  ) +
+  theme_bw(base_size = 10) +
+  labs(
+    x = NULL,
+    y = "Value"
+  ) +
+  theme(
+    # remove x-axis labels and ticks
+    axis.text.x  = element_blank(),
+    axis.ticks.x = element_blank(),
+    strip.text   = element_text(size = 10),
+    axis.text.y  = element_text(size = 10),
+    axis.title.y = element_text(size = 10),
+    legend.text  = element_text(size = 10),
+    legend.title = element_text(size = 10),
+    
+    # make panels closer together
+    panel.spacing.x = unit(0.4, "lines"),
+    panel.spacing.y = unit(0.4, "lines"),
+    
+    # reduce outer plot margins
+    plot.margin = margin(2, 2, 2, 2, "pt"),
+    
+    # optional: move legend and keep it compact
+    legend.position = "bottom"
+  ) +
+  # relabel legend for ida_yn
+  scale_fill_discrete(
+    name   = "IDA status",
+    labels = c(`0` = "No IDA", `1` = "IDA")
+  ) +
+  # significance stars
+  geom_text(
+    data = test_results,
+    aes(x = 1.5, y = y_max, label = significance),
+    inherit.aes = FALSE,
+    size = 4
+  )
+
+##### ML PIPELINE -----------------------------------------------------------------------------------------------------------------------------
+# d.f = cirrho_ida_ml
+# all patients with cirrhosis who have outcome recorded (Ferritin and Hb day of or within 90d prior)
+
+# remove.packages('caret')
+
+table(cirrho_ida_ml$ida_yn) # total without tx  n = 3470, no ida n = 2816, ida n = 654
+# (total with tx  n = 3631, no ida n = 2853, ida n = 778) 
+
+
+### DATA PRE-PROCESSING ----------------------------------------------------------------------------------------------------------------------
+
+## MISSING VALUES ----------------------------------------------------------------------------------------------------------------------------
+# Detect columns with missing values
+missing_cols <- colnames(cirrho_ida_ml)[colSums(is.na(cirrho_ida_ml)) > 0]
+
+# Display columns with missing values
+print(missing_cols)
+
+# Show missing value counts
+missing_counts <- colSums(is.na(cirrho_ida_ml))
+print(missing_counts)
+
+# Set threshold (e.g., drop columns with more than 30% missing values)
+missing_threshold <- 0.3
+
+# Calculate proportion of missing values per column
+missing_proportion <- colMeans(is.na(cirrho_ida_ml))
+
+# Identify columns to keep (those with <= threshold missing proportion)
+cols_to_keep <- names(missing_proportion[missing_proportion <= missing_threshold])
+
+# Subset the data frame to keep only the desired columns
+cirrho_ida_ml_cleaned <- cirrho_ida_ml[, cols_to_keep, drop = FALSE] # crp # creat # bmi >30% missingness therefore removed
+
+# Log transform non-normal variable within cirrho_ida_ml_cleaned
+cirrho_ida_ml_cleaned <- cirrho_ida_ml_cleaned %>%
+  mutate(across(
+    .cols = all_of(c('bili_value','hinr_value','neut_value','pl_fer_value')),
+    .fns = ~ if_else(.x > 0, log(.x), NA_real_), # exclude any '0' results (only single neut result)
+    .names = "log_{.col}"
+  ))
+
+# Select columns for model (should be 16 columns)
+cirrho_ida_ml_cleaned <- cirrho_ida_ml_cleaned %>%
+  dplyr::select(-c(cfer_date, cfer_value, hb_fer_date, bili_value, hinr_value, pl_fer_value, neut_value))
+
+# Relocate outcome variable to end
+cirrho_ida_ml_cleaned <- cirrho_ida_ml_cleaned %>%
+  relocate(ida_yn, .after = last_col())
+
+## ONE-HOT ENCODING ----------------------------------------------------------------------------------------------------------------------------
+# Encode categorical variables 'gender' and 'ethnicity' using one-hot encoding
+install.packages('fastDummies')
+library(fastDummies)
+
+cirrho_ida_ml_cleaned$ethnic_group <- as.factor(cirrho_ida_ml_cleaned$ethnic_group)
+cirrho_ida_ml_cleaned$gender_id_uncoded <- as.factor(cirrho_ida_ml_cleaned$gender_id_uncoded)
+str(cirrho_ida_ml_cleaned)
+
+cirrho_ida_ml_encoded <- dummy_cols(cirrho_ida_ml_cleaned, 
+                                    select_columns = c("ethnic_group", "gender_id_uncoded"), 
+                                    #select_columns = "gender_id_uncoded",
+                                    remove_first_dummy = FALSE, # Keeps all categories
+                                    remove_selected_columns = TRUE)  # Drops original columns
+
+
+
+## DATA SPLITTING ----------------------------------------------------------------------------------------------------------------------------
+# Split data using stratified sampling: 80% train 20% test
+install.packages('caret') # for ML models
+install.packages('VIM') # for KNN imputation
+library(caret)
+library(VIM)
+
+set.seed(123)  # Ensures reproducibility
+train_index <- createDataPartition(cirrho_ida_ml_encoded$ida_yn, p = 0.8, list = FALSE)
+
+# Split the dataset
+train_data <- cirrho_ida_ml_encoded[train_index, ]
+test_data <- cirrho_ida_ml_encoded[-train_index, ]
+
+# Check class distribution
+table(cirrho_ida_ml_encoded$ida_yn) / nrow(cirrho_ida_ml_encoded)  # Overall distribution no ida 81.2% ida 18.8% (with tx no ida 78.6% IDA 21.4%)
+table(train_data$ida_yn) / nrow(train_data)        # Train set distribution no ida 81.4% ida 18.6% (with tx - no ida 78.5% ida 21.5%)
+table(test_data$ida_yn) / nrow(test_data)          # Test set distribution no ida 80.0% ida 20.0% (with tx no ida 79.1% no IDA 20.9%)
+
+
+## CORRELATION MATRIX ---------------------------------------------------------------------------------------------------------------------
+# Compute correlation matrix with the target variable (ida_yn)
+#cor_matrix <- cor(train_data_rm use = "complete.obs")
+
+# Select features with high correlation (absolute value > 0.5) with mpg
+#selected_features <- names(which(abs(cor_matrix["ida_yn", ]) > 0.5))
+#selected_features <- setdiff(selected_features, "ida_yn")  # Remove target variable
+
+# Filter dataset with selected features
+#filtered_data <- data %>% select(all_of(c("ida_yn", selected_features)))
+
+# Print selected features
+#print(selected_features)
+
+## IMPUTATION ----------------------------------------------------------------------------------------------------------------------------
+# KNN imputation
+# (NB No imputation required for XGBoost)
+# Can also try multiple imputation (check if within caret)
+
+# Perform KNN imputation on the training data (replace k=5 with desired k)
+set.seed(123)
+imputed_train_data <- kNN(train_data, k = 5)
+
+# Remove all columns with the "_imp" suffix
+imputed_train_data_cleaned <- imputed_train_data[, !grepl("_imp", names(imputed_train_data))]
+
+# Check the structure of the imputed training data
+str(imputed_train_data_cleaned)
+
+# Perform KNN imputation on the test data using the same model (same k=5 as training data)
+set.seed(123)
+imputed_test_data <- kNN(test_data, k = 5)
+
+# Remove all columns with the "_imp" suffix
+imputed_test_data_cleaned <- imputed_test_data[, !grepl("_imp", names(imputed_test_data))]
+
+# Check the structure of the imputed test data
+str(imputed_test_data_cleaned)
+
+## NORMALISATION ----------------------------------------------------------------------------------------------------------------------------
+# as suitable for combining models (RF, XGBOOST and logistic regression)
+# Compute Min and Max from training data (not all normally distributed despite log transformation so min max better)
+min_vals <- apply(imputed_train_data_cleaned[,2:14], 2, min)
+max_vals <- apply(imputed_train_data_cleaned[,2:14], 2, max)
+
+# Function to normalise using training min/max
+normalize <- function(x, min_val, max_val) {
+  (x - min_val) / (max_val - min_val)
+}
+
+# Apply the same normalisation to train and test sets
+train_data[, 2:14] <- as.data.frame(mapply(normalize, imputed_train_data_cleaned[, 2:14], min_vals, max_vals))
+test_data[, 2:14] <- as.data.frame(mapply(normalize, imputed_test_data_cleaned[, 2:14], min_vals, max_vals))
+
+# Relocate outcome to end
+train_data <- train_data %>% relocate(ida_yn, .after = last_col())
+test_data <- test_data %>% relocate(ida_yn, .after = last_col())
+
+train_data_rm <- train_data %>%
+  dplyr::select(-c(study_subject_id))
+
+# Ensure data in correct format
+train_data_rm <- train_data_rm %>%
+  dplyr::rename(ethnic_group_Not_stated = 'ethnic_group_Not stated')
+
+train_data <- train_data %>%
+  dplyr::rename(ethnic_group_Not_stated = 'ethnic_group_Not stated')
+
+test_data <- test_data %>%
+  dplyr::rename(ethnic_group_Not_stated = 'ethnic_group_Not stated')
+
+str(train_data_rm)
+train_data_rm$ida_yn <- as.factor(train_data_rm$ida_yn)
+
+str(train_data)
+train_data$ida_yn <- as.factor(train_data_rm$ida_yn)
+
+str(test_data)
+test_data$ida_yn <- as.factor(test_data$ida_yn)
+
+setDT(train_data_rm)[,.(count=.N), by=.(ida_yn, `ethnic_group_Not_stated`)]
+
+# Convert ida_yn to factor with 'safe' non-numeric labels
+train_data_rm <- train_data_rm %>%
+  mutate(ida_yn = factor(ida_yn, levels = c(1, 0), labels = c("Class1", "Class0")))
+
+#train_data <- train_data %>%
+# mutate(ida_yn = factor(ida_yn, levels = c(1, 0), labels = c("Class1", "Class0")))
+
+test_data <- test_data %>%
+  mutate(ida_yn = factor(ida_yn, levels = c(1, 0), labels = c("Class1", "Class0")))
+
+
+# -----------------------------------------------------------------------------------------------------------------------------------------------
+## FEATURE LISTS
+# -----------------------------------------------------------------------------------------------------------------------------------------------
+# Of the features available, test subset for clinical feasibility in different clinical settings e.g. in lab
+
+
+# Define named list of different feature sets
+feature_sets <- list(
+  allfeatures = names(train_data_rm)[!names(train_data_rm) %in% "ida_yn"],
+  coreplusprior = c("age", "gender_id_uncoded_Female", "gender_id_uncoded_Male", "hb_fer_value", "mcv_cfer_value", "mch_cfer_value", "log_pl_fer_value", "log_neut_value", "delta_mcv", "delta_hb", "delta_mch", "delta_pl"),
+  corenoprior = c("age", "gender_id_uncoded_Female", "gender_id_uncoded_Male", "hb_fer_value", "mcv_cfer_value", "mch_cfer_value", "log_pl_fer_value", "log_neut_value")
+)
+
+
+
+# -----------------------------------------------------------------------------------------------------------------------------------------------
+## MODEL LISTS
+# -----------------------------------------------------------------------------------------------------------------------------------------------
+# Logistic regression as baseline, tree based models due to ability to handle cont and categorical data, relative flexibility, innate feature ranking
+
+model_list <- list(
+  glmnet = "glmnet",
+  ranger = "ranger", 
+  rpart = "rpart",
+  xgbTree = "xgbTree"
+)
+
+#-----------------------------------------------------------------------------------------------------------------------------------------------
+## MODEL DEVELOPMENT 1: TRAINING + TUNING
+#-----------------------------------------------------------------------------------------------------------------------------------------------
+install.packages("MLmetrics")
+
+library(xgboost)#  needed for xgbTree as per caret github 
+library(pROC)
+library(PRROC)
+library(MLmetrics)
+
+# Create F1 function NO LONGER REQUIRED AS OPTIMISING ON PR AUC
+#f1 <- function (data, lev = NULL, model = NULL) {
+# precision <- posPredValue(data$pred, data$obs, positive = "Class1")
+#recall  <- sensitivity(data$pred, data$obs, positive = "Class1")
+#f1 <- (2 * precision * recall) / (precision + recall)
+#c("F1" = f1)
+#} 
+
+
+# Step 1: Set up training control (with class probabilities, random search and F1 as tuning parameter)
+set.seed(123)
+train_control <- trainControl(
+  method = "repeatedcv",
+  number = 5,
+  repeats = 5,
+  #index = createFolds(train_data_rm$hospital_site, k = *), # If site variable available
+  search = 'random',
+  classProbs = TRUE,
+  summaryFunction = prSummary, # Optimises PR 
+  savePredictions = TRUE
+)
+
+
+# Step 2: Set up training results and final model containers
+results_list <- list()
+final_models <- list()
+
+# Step 3: Loop over each model and each feature set
+for (model_name in names(model_list)) {
+  for (feature_name in names(feature_sets)) {
+    features <- feature_sets[[feature_name]]
+    
+    cat("Training model:", model_name, "| Feature set:", feature_name, "\n")
+    
+    # Create class weights
+    class_counts <- table(train_data_rm$ida_yn)
+    total <- sum(class_counts)
+    class_weights <- total / (2 * class_counts) # inverse class weights
+    weights <- ifelse(
+      train_data_rm$ida_yn == "Class1",
+      class_weights["Class1"],
+      class_weights["Class0"]
+    )
+    
+    # Train model
+    set.seed(123)
+    model <- caret::train(
+      form = as.formula(paste("ida_yn ~", paste(features, collapse = "+"))),
+      data = train_data_rm,
+      method = model_name,
+      metric = "AUC", # optimise PR AUC from prSummary
+      tuneLength = 10,
+      trControl = train_control,
+      weights = weights
+    )
+    
+    key <- paste(feature_name, model_name, sep = "_")
+    
+    results_list[[key]] <- model$results %>%
+      filter(AUC == max(AUC)) %>%
+      mutate(feature_set = feature_name, model = model_name)
+    
+    final_models[[key]] <- model
+  }
+}
+
+train_summary <- bind_rows(results_list)
+print(train_summary)
+
+# prSummary returns AUC (PR AUC), Precision, Recall, and F1 score
+train_summary_final <- train_summary %>%
+  select(feature_set, model, AUC, Precision, Recall, F) %>%
+  arrange(feature_set)
+print(train_summary_final)
+
+
+# -----------------------------------------------------------------------------------------------------------------------------------------------
+## THRESHOLD OPTIMISATION FOR BEST F1 SCORE
+# -----------------------------------------------------------------------------------------------------------------------------------------------
+# -------------------------------------------------------------------------------
+# Find an optimal threshold per (feature_set, model) to maximise F1 with cutpointr
+# -------------------------------------------------------------------------------
+library(cutpointr)
+library(stringr)
+
+# helper: safe F1 (used only for verification, cutpointr uses its own F1_score)
+f1_safe <- function(tp, fp, fn, tn) {
+  precision <- ifelse(tp + fp == 0, 0, tp / (tp + fp))
+  recall    <- ifelse(tp + fn == 0, 0, tp / (tp + fn))
+  if ((precision + recall) == 0) return(0)
+  2 * precision * recall / (precision + recall)
+}
+
+threshold_objects <- list()
+threshold_summary <- list()
+
+for (key in names(final_models)) {
+  m <- final_models[[key]]
+  stopifnot(!is.null(m$pred))  # need saved CV predictions
+  
+  # Positive class is the first level (you relevelled to "Class1")
+  pos_class <- m$levels[1]
+  
+  # Keep only rows for best-tuned params (defensive even though savePredictions="final")
+  preds <- m$pred
+  bt    <- m$bestTune
+  if (!is.null(bt) && nrow(bt) > 0 && all(names(bt) %in% names(preds))) {
+    preds <- dplyr::semi_join(preds, bt, by = names(bt))
+  }
+  
+  # Probability column for the positive class has the same name as that class
+  prob_col <- pos_class
+  if (!prob_col %in% names(preds)) {
+    stop(sprintf("Couldn't find probability column '%s' in predictions for %s.", prob_col, key))
+  }
+  
+  df <- preds %>%
+    dplyr::select(obs, !!rlang::sym(prob_col)) %>%
+    dplyr::rename(truth = obs, score = !!rlang::sym(prob_col)) %>%
+    dplyr::mutate(truth = forcats::fct_relevel(truth, pos_class))
+  
+  # Use cutpointr to maximise F1 on the out-of-fold predictions
+  cp <- cutpointr(
+    data       = df,
+    x          = score,
+    class      = truth,
+    pos_class  = pos_class,
+    direction  = ">=",
+    method     = maximize_metric,
+    metric     = F1_score         # built-in metric in cutpointr
+  )
+  
+  # Store full object (plots, bootstrap, etc. can be done later)
+  threshold_objects[[key]] <- cp
+  
+  # Derive a concise summary row
+  opt_thr <- cp$optimal_cutpoint
+  
+  # Compute precision/recall/F1 at the chosen threshold (for a clear summary table)
+  pred_lbl <- factor(ifelse(df$score >= opt_thr, pos_class, setdiff(levels(df$truth), pos_class)[1]),
+                     levels = levels(df$truth))
+  tp <- sum(pred_lbl == pos_class & df$truth == pos_class)
+  fp <- sum(pred_lbl == pos_class & df$truth != pos_class)
+  fn <- sum(pred_lbl != pos_class & df$truth == pos_class)
+  tn <- sum(pred_lbl != pos_class & df$truth != pos_class)
+  precision <- ifelse(tp + fp == 0, 0, tp / (tp + fp))
+  recall    <- ifelse(tp + fn == 0, 0, tp / (tp + fn))
+  f1_val    <- f1_safe(tp, fp, fn, tn)
+  
+  # Parse feature_set and model from the key "<feature_set>_<model>"
+  parts <- strsplit(key, "_")[[1]]
+  feature_set_i <- parts[1]
+  model_i       <- paste(parts[-1], collapse = "_")
+  
+  threshold_summary[[key]] <- dplyr::tibble(
+    feature_set        = feature_set_i,
+    model              = model_i,
+    optimal_threshold  = opt_thr,
+    F1_oof             = f1_val,
+    precision_oof      = precision,
+    recall_oof         = recall,
+    tp = tp, fp = fp, fn = fn, tn = tn
+  )
+}
+
+threshold_summary <- dplyr::bind_rows(threshold_summary) %>%
+  dplyr::arrange(dplyr::desc(F1_oof))
+
+print(threshold_summary)
+
+
+# --------------------------------------------------------------------------------
+## MODEL DEVELOPMENT 2: CV PERFORMANCE EVALUATION SUMMARY FOR BEST TUNES AT OPTIMAL THRESHOLD (mean + 95% CI)
+# --------------------------------------------------------------------------------
+library(purrr)
+library(rlang)
+library(tibble)
+library(forcats)
+
+# Helpers ------------------------------------------------------------------------
+safe_div <- function(num, den) ifelse(den == 0, NA_real_, num / den)
+f1_from_counts <- function(tp, fp, fn) {
+  precision <- safe_div(tp, tp + fp)
+  recall    <- safe_div(tp, tp + fn)
+  ifelse((precision + recall) == 0, NA_real_, 2 * precision * recall / (precision + recall))
+}
+summarise_ci_df <- function(x) {
+  x <- x[is.finite(x)]
+  n <- length(x)
+  mu <- mean(x)
+  if (n > 1) {
+    s  <- sd(x)
+    se <- s / sqrt(n)
+    tcrit <- qt(0.975, df = n - 1)
+    tibble(estimate = mu, ci_lower = mu - tcrit * se, ci_upper = mu + tcrit * se, n_folds = n)
+  } else {
+    tibble(estimate = mu, ci_lower = NA_real_, ci_upper = NA_real_, n_folds = n)
+  }
+}
+
+# Core computation ---------------------------------------------------------------
+perf_rows <- map(names(final_models), function(key) {
+  m <- final_models[[key]]
+  pos_class <- m$levels[1]
+  neg_class <- setdiff(m$levels, pos_class)[1]
+  
+  parts <- strsplit(key, "_")[[1]]
+  feature_set_i <- parts[1]
+  model_i       <- paste(parts[-1], collapse = "_")
+  
+  # Threshold selected for this pair
+  thr_row <- threshold_summary %>%
+    dplyr::filter(feature_set == feature_set_i, model == model_i)
+  if (nrow(thr_row) != 1) return(NULL)
+  thr <- thr_row$optimal_threshold[[1]]
+  
+  # Keep only predictions for the best-tuned params
+  preds <- m$pred
+  bt <- m$bestTune
+  if (!is.null(bt) && nrow(bt) > 0 && all(names(bt) %in% names(preds))) {
+    preds <- dplyr::semi_join(preds, bt, by = names(bt))
+  }
+  
+  # Ensure the fold column exists
+  stopifnot("Resample" %in% names(preds))
+  
+  score <- preds[[pos_class]]
+  truth <- forcats::fct_relevel(preds$obs, pos_class)
+  
+  df <- tibble(
+    Resample = preds$Resample, # <- keep caret's exact column name
+    truth    = truth,
+    score    = score
+  )
+  
+  # Per-fold metrics (threshold-dependent + threshold-independent)
+  fold_metrics <- split(df, df$Resample) %>%
+    map_dfr(function(d) {
+      pred_pos <- d$score >= thr
+      tp <- sum(pred_pos & d$truth == pos_class)
+      fp <- sum(pred_pos & d$truth == neg_class)
+      fn <- sum(!pred_pos & d$truth == pos_class)
+      tn <- sum(!pred_pos & d$truth == neg_class)
+      
+      sensitivity <- safe_div(tp, tp + fn)   # TPR / Recall
+      specificity <- safe_div(tn, tn + fp)   # TNR
+      precision   <- safe_div(tp, tp + fp)   # PPV
+      f1          <- f1_from_counts(tp, fp, fn)
+      
+      # PR AUC & ROC AUC (skip if single-class fold)
+      has_pos <- any(d$truth == pos_class)
+      has_neg <- any(d$truth == neg_class)
+      pr_auc  <- NA_real_
+      roc_auc <- NA_real_
+      if (has_pos && has_neg) {
+        pr_auc <- tryCatch({
+          PRROC::pr.curve(
+            scores.class0 = d$score[d$truth == pos_class],
+            scores.class1 = d$score[d$truth == neg_class],
+            curve = FALSE
+          )$auc.integral
+        }, error = function(e) NA_real_)
+        roc_auc <- tryCatch({
+          as.numeric(pROC::auc(
+            response  = d$truth,
+            predictor = d$score,
+            levels    = c(neg_class, pos_class)
+          ))
+        }, error = function(e) NA_real_)
+      }
+      
+      tibble(
+        Resample   = unique(d$Resample),
+        Sensitivity = sensitivity,
+        Specificity = specificity,
+        Precision   = precision,
+        F1          = f1,
+        `PR AUC`    = pr_auc,
+        `ROC AUC`   = roc_auc
+      )
+    })
+  
+  # Mean & 95% CI per metric across folds
+  summary_long <- fold_metrics %>%
+    select(-Resample) %>%
+    pivot_longer(everything(), names_to = "metric", values_to = "value") %>%
+    group_by(metric) %>%
+    summarise(summarise_ci_df(value), .groups = "drop") %>%
+    mutate(
+      feature_set       = feature_set_i,
+      model             = model_i,
+      optimal_threshold = thr
+    ) %>%
+    select(feature_set, model, optimal_threshold, metric, estimate, ci_lower, ci_upper)
+  
+  summary_long
+}) %>%
+  compact() %>%
+  bind_rows() %>%
+  arrange(feature_set, model, metric) %>%
+  mutate(
+    estimate = round(estimate, 3),
+    ci_lower = round(ci_lower, 3),
+    ci_upper = round(ci_upper, 3)
+  )
+
+perf_table <- perf_rows
+
+# Display grouped by feature_set
+perf_table %>%
+  group_by(feature_set) %>%
+  arrange(model, metric, .by_group = TRUE) %>%
+  print(n = Inf)
+
+
+# Build a robust metric order (use your preferred order when present; append any extras)
+metrics_available <- perf_table %>%
+  distinct(metric) %>%
+  pull(metric) %>%
+  as.character()
+
+default_order <- c("Sensitivity","Specificity","Precision","F1","PR AUC","ROC AUC")
+metric_order <- c(intersect(default_order, metrics_available),
+                  setdiff(metrics_available, default_order))
+
+# 1) Wide table: three columns per metric (_estimate, _ci_lower, _ci_upper)
+perf_wide <- perf_table %>%
+  mutate(metric = as.character(metric)) %>%
+  pivot_wider(
+    id_cols     = c(feature_set, model, optimal_threshold),
+    names_from  = metric,
+    values_from = c(estimate, ci_lower, ci_upper),
+    names_glue  = "{metric}_{.value}"   # e.g., "Sensitivity_estimate"
+  ) %>%
+  { 
+    ci_parts  <- c("estimate","ci_lower","ci_upper")
+    col_order <- c("feature_set","model","optimal_threshold",
+                   as.vector(sapply(metric_order, function(m) paste0(m, "_", ci_parts))))
+    select(., any_of(col_order))
+  } %>%
+  arrange(feature_set, model)
+
+# 2) Wide "pretty" table: one formatted column per metric, e.g. 0.842 (0.802 - 0.881)
+perf_wide_pretty <- perf_table %>%
+  mutate(
+    metric = as.character(metric),
+    pretty = sprintf("%.2f (%.2f-%.2f)", estimate, ci_lower, ci_upper)
+  ) %>%
+  select(feature_set, model, optimal_threshold, metric, pretty) %>%
+  pivot_wider(
+    id_cols     = c(feature_set, model, optimal_threshold),
+    names_from  = metric,
+    values_from = pretty
+  ) %>%
+  select(feature_set, model, optimal_threshold, all_of(metric_order)) %>%
+  arrange(feature_set, model)
+
+# Inspect
+perf_wide
+perf_wide_pretty
+
+# Export 
+install.packages(c("officer","flextable"))
+library(officer)
+library(flextable)
+trained_models_evaluation_20251205 <- perf_wide_pretty
+ft <- flextable(trained_models_evaluation_20251205)
+ft <- theme_vanilla(ft)
+ft <- autofit(ft)
+ft <- align(ft, align = "center", part = "header")
+
+# 3) write to Word with a heading
+doc <- read_docx()
+doc <- body_add_par(doc, "trained_models_evaluation_20251205", style = "heading 1")
+doc <- body_add_flextable(doc, ft)
+
+print(doc, target = "trained_model_evaluation.docx")
+
+
+
+# -----------------------------------------------------------------------------------------------------------------------------------------------
+## FINAL MODEL = CORE PLUS PRIOR, RANGER (coreplusprior_ranger)
+# -----------------------------------------------------------------------------------------------------------------------------------------------
+# Choice is a pragmatic decision
+# Based on technical performance: F1 score 0.699 (0.689 - 0.709) NB overlaps with 'best performing' all features ranger
+# AND clinical usability: Less features, bili and INR have degree of missingness (more so in primary care) therefore limit inclusion/generalisability/ opportunity for external validation
+
+
+
+
+# -------------------------------------------------------------------------------
+# EVALUATION ON TEST SET: final ranger model with 'coreplusprior' features
+# Metrics: Sensitivity, Specificity, Precision, F1, PR AUC, ROC AUC
+# 95% CIs via bootstrap resampling
+# -------------------------------------------------------------------------------
+
+library(dplyr)
+library(tibble)
+library(forcats)
+library(pROC)   # ROC AUC
+library(PRROC)  # PR AUC
+library(purrr)
+library(rlang)
+
+# 1) Identify the trained model & its optimal threshold -------------------------
+model_key <- "coreplusprior_ranger"
+stopifnot(model_key %in% names(final_models))
+
+final_ranger <- final_models[[model_key]]
+
+opt_thr <- threshold_summary %>%
+  dplyr::filter(feature_set == "coreplusprior", model == "ranger") %>%
+  dplyr::pull(optimal_threshold) %>%
+  .[[1]]
+
+# 2) Build the test frame (same features used in training) ----------------------
+features <- feature_sets$coreplusprior
+
+test_core <- test_data %>%
+  dplyr::select(dplyr::all_of(features), ida_yn) %>%
+  dplyr::mutate(
+    # Make sure the positive class is first ("Class1"), consistent with training
+    ida_yn = forcats::fct_relevel(ida_yn, "Class1")
+  )
+
+pos_class <- "Class1"
+neg_class <- "Class0"
+
+# 3) Predict probabilities for the positive class on the test set --------------
+test_scores <- predict(final_ranger, newdata = test_core, type = "prob")[, pos_class]
+truth       <- test_core$ida_yn
+
+# 4) Helper to compute all metrics on a given sample ---------------------------
+safe_div <- function(a, b) ifelse(b == 0, NA_real_, a / b)
+
+compute_metrics <- function(truth, scores, thr, pos = pos_class, neg = neg_class) {
+  pred_pos <- scores >= thr
+  tp <- sum(pred_pos & truth == pos)
+  fp <- sum(pred_pos & truth == neg)
+  fn <- sum(!pred_pos & truth == pos)
+  tn <- sum(!pred_pos & truth == neg)
+  
+  sensitivity <- safe_div(tp, tp + fn)              # recall / TPR
+  specificity <- safe_div(tn, tn + fp)              # TNR
+  precision   <- safe_div(tp, tp + fp)              # PPV
+  f1 <- if (is.na(precision) || is.na(sensitivity) || (precision + sensitivity) == 0) {
+    NA_real_
+  } else {
+    2 * precision * sensitivity / (precision + sensitivity)
+  }
+  
+  # PR AUC (needs both classes to be present; return NA if not)
+  pr_auc <- tryCatch({
+    PRROC::pr.curve(
+      scores.class0 = scores[truth == pos],   # PRROC uses this naming quirk
+      scores.class1 = scores[truth == neg],
+      curve = FALSE
+    )$auc.integral
+  }, error = function(e) NA_real_)
+  
+  # ROC AUC (also needs both classes)
+  roc_auc <- tryCatch({
+    as.numeric(pROC::auc(
+      response  = truth,
+      predictor = scores,
+      levels    = c(neg, pos)
+    ))
+  }, error = function(e) NA_real_)
+  
+  c(
+    Sensitivity = sensitivity,
+    Specificity = specificity,
+    Precision   = precision,
+    F1          = f1,
+    `PR AUC`    = pr_auc,
+    `ROC AUC`   = roc_auc
+  )
+}
+
+# 5) Point estimates on the full test set --------------------------------------
+point_est <- compute_metrics(truth, test_scores, opt_thr)
+
+# 6) Bootstrap 95% CIs (percentile method) -------------------------------------
+set.seed(123)       # reproducible bootstrap
+B <- 1000           # increase/decrease for precision vs. speed
+n <- length(truth)
+
+boot_mat <- replicate(B, {
+  idx <- sample.int(n, replace = TRUE)
+  # compute on the bootstrap sample (may yield NAs if only one class sampled)
+  compute_metrics(truth[idx], test_scores[idx], opt_thr)
+})
+
+# Summarise CIs (ignore NAs caused by all-one-class bootstrap samples)
+metric_names <- names(point_est)
+ci_bounds <- t(apply(boot_mat, 1, function(x) {
+  stats::quantile(x, probs = c(0.025, 0.975), na.rm = TRUE, names = FALSE)
+}))
+colnames(ci_bounds) <- c("ci_lower", "ci_upper")
+rownames(ci_bounds) <- metric_names
+
+# 7) Nice, readable results table ----------------------------------------------
+test_eval_tbl <- tibble::tibble(
+  metric   = metric_names,
+  estimate = as.numeric(point_est[metric_names]),
+  ci_lower = ci_bounds[metric_names, "ci_lower"],
+  ci_upper = ci_bounds[metric_names, "ci_upper"]
+) %>%
+  dplyr::mutate(
+    estimate = round(estimate, 3),
+    ci_lower = round(ci_lower, 3),
+    ci_upper = round(ci_upper, 3)
+  )
+
+test_eval_tbl_pretty <- test_eval_tbl %>%
+  dplyr::mutate(value = sprintf("%.3f (%.3f-%.3f)", estimate, ci_lower, ci_upper)) %>%
+  dplyr::select(Metric = metric, `Estimate (95% CI)` = value)
+
+# Display
+cat(sprintf("\nFinal model: ranger | Feature set: coreplusprior | Optimal threshold = %.3f\n\n", opt_thr))
+print(test_eval_tbl_pretty, n = Inf)
+
+
+# -------------------------------------------------------------------------------
+# CONFUSION MATRIX (TEST SET) FOR FINAL RANGER (coreplusprior)
+# - Pretty ggplot heatmap with counts + row %
+# - Optional gt table with totals
+# - Saves PNG/PDF for thesis
+# -------------------------------------------------------------------------------
+
+install.packages("gt")
+library(scales)
+library(gt)
+
+# 0) Predicted labels at the chosen threshold -----------------------------------
+pred_label <- factor(
+  ifelse(test_scores >= opt_thr, pos_class, neg_class),
+  levels = c(pos_class, neg_class)  # keep positive class first
+)
+
+# 1) caret confusionMatrix (for verification / appendix) ------------------------
+cm_caret <- caret::confusionMatrix(
+  data      = pred_label,
+  reference = truth,
+  positive  = pos_class
+)
+cm_caret
+
+# 2) Tidy counts + row/overall percentages -------------------------------------
+cm_df <- tibble(truth = truth, pred = pred_label) %>%
+  count(truth, pred, name = "n") %>%
+  complete(truth = c(pos_class, neg_class),
+           pred  = c(pos_class, neg_class),
+           fill  = list(n = 0)) %>%
+  group_by(truth) %>%
+  mutate(row_total = sum(n),
+         row_pct   = n / row_total) %>%
+  ungroup() %>%
+  mutate(total_n = sum(n),
+         overall_pct = n / total_n,
+         cell = dplyr::case_when(
+           truth == pos_class & pred == pos_class ~ "TP",
+           truth == pos_class & pred == neg_class ~ "FN",
+           truth == neg_class & pred == pos_class ~ "FP",
+           truth == neg_class & pred == neg_class ~ "TN",
+           TRUE ~ NA_character_
+         ))
+
+# 3) Publication-quality heatmap ------------------------------------------------
+#    - Annotates each tile with count and row %
+#    - Saves PNG + PDF for insertion into your thesis
+heatmap_plot <- ggplot(cm_df, aes(x = pred, y = truth, fill = n)) +
+  geom_tile(color = "white", linewidth = 0.6) +
+  geom_text(aes(label = paste0(n, "\n", percent(row_pct, accuracy = 0.1))),
+            size = 5, lineheight = 0.95) +
+  scale_fill_gradient(low = "#e8eef9", high = "#1f77b4") +
+  scale_x_discrete(position = "top",
+                   labels = c(setNames(c("Predicted: IDA", "Predicted: No IDA"),
+                                       c(pos_class, neg_class)))) +
+  scale_y_discrete(labels = c(setNames(c("Actual: IDA", "Actual: No IDA"),
+                                       c(pos_class, neg_class)))) +
+  labs(
+    title    = "Confusion Matrix - Final Ranger (coreplusprior) on Test Set",
+    subtitle = sprintf("Threshold = %.3f | Row labels show actual class; tile text: count and row percentage", opt_thr),
+    x = NULL, y = NULL, fill = "Count"
+  ) +
+  coord_fixed() +
+  theme_minimal(base_size = 14) +
+  theme(
+    panel.grid = element_blank(),
+    plot.title = element_text(face = "bold"),
+    axis.text.x = element_text(face = "bold"),
+    axis.text.y = element_text(face = "bold")
+  )
+
+# Display in R session
+heatmap_plot
+
+# Save high-res figures for thesis
+ggsave("confusion_matrix_ranger_coreplusprior_test.png", heatmap_plot, width = 6.5, height = 5.5, dpi = 300)
+ggsave("confusion_matrix_ranger_coreplusprior_test.pdf", heatmap_plot, width = 6.5, height = 5.5)
+
+# 4) Optional: a clean table with totals using gt --------------------------------
+cm_table <- cm_df %>%
+  select(truth, pred, n) %>%
+  mutate(truth = recode(truth, !!pos_class := "Actual: IDA", !!neg_class := "Actual: No IDA"),
+         pred  = recode(pred,  !!pos_class := "Predicted: IDA", !!neg_class := "Predicted: No IDA")) %>%
+  pivot_wider(names_from = pred, values_from = n) %>%
+  mutate(Total = rowSums(across(starts_with("Predicted")))) %>%
+  arrange(desc(truth))  # puts "Actual: IDA" first
+
+# Column totals
+col_totals <- cm_table %>%
+  summarise(across(where(is.numeric), sum)) %>%
+  mutate(truth = "Total")
+
+cm_table_totals <- bind_rows(cm_table, col_totals)
+
+confusion_gt <- cm_table_totals %>%
+  gt(rowname_col = "truth") %>%
+  tab_header(
+    title = md("**Confusion Matrix - Final Ranger (coreplusprior) on Test Set**"),
+    subtitle = md(sprintf("Threshold = %.3f", opt_thr))
+  ) %>%
+  fmt_number(everything(), decimals = 0) %>%
+  tab_style(
+    style = list(cell_fill(color = "#f5f7fb")),
+    locations = cells_body(rows = truth == "Total")
+  ) %>%
+  cols_label(
+    `Predicted: IDA` = "Predicted: IDA",
+    `Predicted: No IDA` = "Predicted: No IDA",
+    Total = "Row total"
+  ) %>%
+  tab_options(table.font.size = px(14))
+
+confusion_gt
+
+# Optionally save the table to PNG (requires webshot2)
+# install.packages("webshot2")
+# webshot2::install_phantomjs()
+# gtsave(confusion_gt, "confusion_matrix_ranger_coreplusprior_test_table.png")
+
+
+# ------------------------------------------------------------------------------
+# PR and ROC curves for final ranger (coreplusprior) on TEST set
+# - Uses PRROC (PR) and pROC (ROC)
+# - Annotates the operating point at your chosen threshold
+# - Saves PNG + PDF figures for your thesis
+# ------------------------------------------------------------------------------
+
+# 0) Helpful quantities ---------------------------------------------------------
+prev <- mean(truth == pos_class)  # class prevalence (baseline for PR curve)
+
+# Operating point (thresholded prediction)
+pred_pos <- test_scores >= opt_thr
+tp <- sum(pred_pos & truth == pos_class)
+fp <- sum(pred_pos & truth == neg_class)
+fn <- sum(!pred_pos & truth == pos_class)
+tn <- sum(!pred_pos & truth == neg_class)
+
+precision_op <- ifelse(tp + fp == 0, NA_real_, tp / (tp + fp))
+recall_op    <- ifelse(tp + fn == 0, NA_real_, tp / (tp + fn))
+
+# 1) Precision-Recall curve -----------------------------------------------------
+# PRROC expects "scores.class0" = scores for POSITIVES, and "scores.class1" = scores for NEGATIVES
+pr <- PRROC::pr.curve(
+  scores.class0 = test_scores[truth == pos_class],
+  scores.class1 = test_scores[truth == neg_class],
+  curve = TRUE
+)
+pr_auc <- pr$auc.integral
+pr_df  <- tibble(recall = pr$curve[, 1], precision = pr$curve[, 2])
+
+pr_plot <- ggplot(pr_df, aes(x = recall, y = precision)) +
+  geom_line(linewidth = 1.2, color = "#1f77b4") +
+  geom_hline(yintercept = prev, linetype = "dashed", color = "grey50") +
+  geom_point(aes(x = recall_op, y = precision_op),
+             size = 3.5, shape = 21, fill = "#d62728", color = "white", stroke = 1) +
+  annotate("label", x = recall_op, y = precision_op,
+           label = sprintf("Thr = %.3f", opt_thr), vjust = -1, size = 4) +
+  labs(
+    title    = "Precision-Recall Curve - Final Ranger (coreplusprior) on Test Set",
+    subtitle = sprintf("PR AUC = %.3f   |   Prevalence = %.1f%%", pr_auc, 100 * prev),
+    x = "Recall (Sensitivity)",
+    y = "Precision (PPV)"
+  ) +
+  coord_cartesian(xlim = c(0, 1), ylim = c(0, 1)) +
+  theme_minimal(base_size = 14) +
+  theme(
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold")
+  )
+
+pr_plot
+ggsave("PR_curve_ranger_coreplusprior_test.png", pr_plot, width = 6.5, height = 5.5, dpi = 300)
+ggsave("PR_curve_ranger_coreplusprior_test.pdf", pr_plot, width = 6.5, height = 5.5)
+
+# -----------------------------------------------------------------------------------------------------------------------------------------------
+## FEATURE IMPORTANCE OF FINAL MODEL 
+# -----------------------------------------------------------------------------------------------------------------------------------------------
+
+# ------------------------------------------------------------------------------
+# SHAP explanations for final ranger (coreplusprior) on TEST set
+# - Mean |SHAP| importance bar plot
+# - SHAP beeswarm (each point = a patient)
+# - Saves PNG/PDF figures for the thesis
+# ------------------------------------------------------------------------------
+
+# =======================
+# SHAP for FINAL MODEL on TEST SET (ranger + coreplusprior)
+# =======================
+
+# If needed (run once):
+# install.packages(c("fastshap", "shapviz"))
+
+library(dplyr)
+library(ggplot2)
+library(fastshap)
+library(shapviz)
+
+set.seed(123)
+
+# 0) Sanity checks --------------------------------------------------------------
+stopifnot(exists("final_ranger"))
+stopifnot(exists("test_core"))
+stopifnot(exists("feature_sets"))
+features <- feature_sets$coreplusprior
+
+# 1) Test-set feature matrix (drop outcome) ------------------------------------
+X_test <- test_core %>% dplyr::select(dplyr::all_of(features))
+
+# 2) Prediction wrapper: return P(IDA = Class1) --------------------------------
+pfun <- function(object, newdata) {
+  # 'final_ranger' is a caret::train (method = ranger)
+  predict(object, newdata = newdata, type = "prob")[, "Class1"]
+}
+
+# 3) Compute SHAP values on the TEST set ---------------------------------------
+#    nsim controls Monte Carlo accuracy; increase (e.g., 500-1000) for smoother results.
+shap_test <- fastshap::explain(
+  object       = final_ranger,  # caret model
+  X            = X_test,        # rows to explain (TEST patients)
+  pred_wrapper = pfun,
+  nsim         = 300
+)
+# shap_test is a data frame: rows = patients, columns = features.
+# Each cell is the SHAP contribution to P(IDA) for that feature & patient.
+
+# 4) Build a shapviz object for easy plotting ----------------------------------
+# Baseline = mean predicted probability in the TEST set (optional but nice for interpretability)
+baseline_prob <- mean(pfun(final_ranger, X_test))
+sv <- shapviz::shapviz(shap_test, X = X_test, baseline = baseline_prob)
+
+# 5) Global importance: mean(|SHAP|) per feature (bar plot) --------------------
+p_imp <- sv_importance(sv, kind = "bar") +
+  ggplot2::labs(
+    title = "Mean |SHAP| (Global Importance)",
+    subtitle = "Final model: ranger (coreplusprior), evaluated on TEST set",
+    x = "Average absolute SHAP contribution to P(IDA)"
+  )
+p_imp
+
+# Optional: a tidy importance table you can export
+imp_tbl <- shap_test |>
+  tibble::as_tibble() |>
+  tidyr::pivot_longer(everything(),
+                      names_to = "feature",
+                      values_to = "shap") |>
+  group_by(feature) |>
+  summarise(mean_abs_shap = mean(abs(shap), na.rm = TRUE), .groups = "drop") |>
+  arrange(desc(mean_abs_shap))
+# readr::write_csv(imp_tbl, "shap_importance_table_test.csv")
+
+# 6) Beeswarm plot: patient-level effects per feature --------------------------
+p_bee <- sv_importance(sv, kind = "beeswarm") +
+  ggplot2::labs(
+    title = "SHAP Beeswarm (TEST set)",
+    subtitle = "Each dot = one patient; colour = feature value; position = effect on P(IDA)"
+  )
+p_bee
+
+# 7) Save figures for reports/thesis -------------------------------------------
+ggplot2::ggsave("shap_importance_bar_test_20251205.png", p_imp, width = 6.5, height = 5.5, dpi = 300)
+ggplot2::ggsave("shap_beeswarm_test_20251205.png", p_bee, width = 6.5, height = 5.5, dpi = 300)
+ggplot2::ggsave("shap_importance_bar_test_20251205.pdf", p_imp, width = 6.5, height = 5.5)
+ggplot2::ggsave("shap_beeswarm_test_20251205.pdf", p_bee, width = 6.5, height = 5.5)
